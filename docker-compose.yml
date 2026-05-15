@@ -1,0 +1,44 @@
+# BSFChat production docker-compose
+#
+# Deployment:
+#   1. Copy this file + config/ to your server
+#   2. Edit .env to set your domain and secrets
+#   3. Edit config/server.toml and config/identity.toml for your setup
+#   4. docker compose up -d
+#
+# Put a reverse proxy (nginx, Caddy, Traefik) in front of this to terminate TLS.
+# Suggested routing:
+#   chat.yourdomain.com → localhost:8448 (chat server)
+#   id.yourdomain.com   → localhost:8480 (identity service)
+#   s3.yourdomain.com   → localhost:9000 (minio, optional — only if you want external media access)
+
+services:
+  server:
+    image: ghcr.io/bsfchat/server:main
+    container_name: bsfchat-server
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8448:8448"
+    volumes:
+      - ./data/server:/data
+      - ./config/server.toml:/etc/bsfchat/server.toml:ro
+
+  identity:
+    image: ghcr.io/bsfchat/identity:main
+    container_name: bsfchat-identity
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8480:8480"
+    volumes:
+      - ./data/identity:/data
+      - ./config/identity.toml:/etc/bsfchat/identity.toml:ro
+
+  # Optional: coturn for voice chat NAT traversal.
+  # Only needed if users are across different networks.
+  # coturn:
+  #   image: coturn/coturn:latest
+  #   container_name: bsfchat-coturn
+  #   restart: unless-stopped
+  #   network_mode: host  # coturn needs host networking for port range
+  #   volumes:
+  #     - ./config/turnserver.conf:/etc/coturn/turnserver.conf:ro

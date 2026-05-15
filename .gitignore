@@ -1,0 +1,11 @@
+# Runtime state — postgres data, minio buckets, media uploads,
+# letsencrypt certs etc. all land here at `docker compose up` time.
+# Lives on the production host, never in git.
+data/
+
+# The actual secrets file — only .env.example is checked in.
+.env
+
+# Editor scratch
+*.swp
+.DS_Store
