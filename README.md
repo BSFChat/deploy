@@ -31,8 +31,11 @@ Production docker-compose setup for deploying BSFChat to your own server.
 - **bsfchat-identity** (`localhost:8480`) — OIDC identity provider with web UI
 - **bsfchat-minio** (`localhost:9000`) — S3-compatible object storage for media
   - Web console at `localhost:9001`
+- **bsfchat-coturn** (host network, port `3478`) — STUN/TURN relay for voice
 
-All services bind to `127.0.0.1` only — use a reverse proxy for public access.
+All HTTP services bind to `127.0.0.1` only — use a reverse proxy for public
+access. coturn is the exception: it must be reachable directly (see Voice Chat
+below), never proxied.
 
 ## Reverse Proxy Setup
 
@@ -79,15 +82,25 @@ server {
 }
 ```
 
-## Voice Chat (Optional)
+## Voice Chat
 
-For voice chat to work across NATs, you need a TURN server. Uncomment the `coturn` service in `docker-compose.yml` and:
+Voice needs a STUN/TURN server for NAT traversal — without TURN, users behind
+symmetric NAT or CGNAT can't connect at all. The compose file runs `coturn`
+for this (host networking, so no reverse proxy involved — TURN is not HTTP).
 
-1. Create `config/turnserver.conf` with your config
-2. Update `config/server.toml` to point at it
-3. Open UDP port 3478 and the relay port range (e.g. 49152-65535) on your firewall
+1. Generate a secret: `openssl rand -hex 32`
+2. Set it in **both** places (they must match):
+   - `config/turnserver.conf` — `static-auth-secret`
+   - `config/server.toml` — `turn_secret` under `[voice]`
+3. In `config/turnserver.conf`, set `realm` to your domain, and set
+   `external-ip` if the server is behind NAT (typical cloud VPS)
+4. In `config/server.toml`, point `stun_uri`/`turn_uri` at your domain
+5. Open on your firewall:
+   - `3478` tcp + udp (STUN/TURN)
+   - `49160-49200` udp (media relay range)
 
-For LAN-only deployments, set `allow_peer_to_peer = true` in `server.toml` — no TURN needed.
+The server issues short-lived TURN credentials from the shared secret
+(`turn_ttl`, default 3600s) — no static TURN username/password to manage.
 
 ## Data Persistence
 

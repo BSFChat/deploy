@@ -33,12 +33,16 @@ services:
       - ./data/identity:/data
       - ./config/identity.toml:/etc/bsfchat/identity.toml:ro
 
-  # Optional: coturn for voice chat NAT traversal.
-  # Only needed if users are across different networks.
-  # coturn:
-  #   image: coturn/coturn:latest
-  #   container_name: bsfchat-coturn
-  #   restart: unless-stopped
-  #   network_mode: host  # coturn needs host networking for port range
-  #   volumes:
-  #     - ./config/turnserver.conf:/etc/coturn/turnserver.conf:ro
+  # coturn: TURN relay for voice chat NAT traversal. Without it, users behind
+  # symmetric NAT/CGNAT can't connect to voice at all — leave it enabled.
+  # Before starting: set static-auth-secret in config/turnserver.conf and the
+  # matching turn_secret in config/server.toml (they must be identical).
+  # Do NOT put this behind the reverse proxy — TURN is not HTTP.
+  # Open on your firewall: 3478 tcp+udp, 49160-49200 udp.
+  coturn:
+    image: coturn/coturn
+    container_name: bsfchat-coturn
+    restart: unless-stopped
+    network_mode: host  # coturn needs host networking for the relay port range
+    volumes:
+      - ./config/turnserver.conf:/etc/coturn/turnserver.conf:ro
