@@ -40,7 +40,12 @@ services:
   # Do NOT put this behind the reverse proxy — TURN is not HTTP.
   # Open on your firewall: 3478 tcp+udp, 49160-49200 udp.
   coturn:
-    image: coturn/coturn
+    # Pinned, not :latest — coturn is internet-facing and terminates
+    # untrusted UDP/TCP. 4.11.0 clears the 2025-2026 advisories:
+    # CVE-2025-69217 (predictable nonces via libc random()),
+    # CVE-2026-43994 (OAuth-GCM stack overflow), CVE-2026-43915
+    # (web-admin stored XSS). Bump deliberately, re-checking advisories.
+    image: coturn/coturn:4.11.0
     container_name: bsfchat-coturn
     restart: unless-stopped
     network_mode: host  # coturn needs host networking for the relay port range
