@@ -1,0 +1,146 @@
+# /etc/nginx/sites-available/bsfchat
+#
+# GENERATED FILE — do not edit. Edit ../.env and re-run ./setup.sh.
+# The template lives at nginx/bsfchat.conf.template.
+#
+# ===========================================================================
+#  READ THIS BEFORE GOING LIVE — origin TLS
+# ===========================================================================
+#  As shipped, this file listens on port 80 only. That is fine while you are
+#  getting a certificate, and NOT fine afterwards.
+#
+#  If you put Cloudflare (or any other CDN) in front of a plaintext origin
+#  and leave its SSL/TLS mode on "Flexible", the padlock your users see is a
+#  lie: the CDN-to-origin leg is unencrypted HTTP across the public internet.
+#  Anyone on that path — the hosting provider, a transit network, whoever
+#  runs the rack — reads every message, media upload and access token in
+#  clear text. For a product whose pitch is self-hosting and not trusting
+#  someone else's servers, that is the whole thing undone.
+#
+#  Do this instead:
+#    1. Get a certificate on the origin:
+#         sudo apt install certbot python3-certbot-nginx
+#         sudo certbot --nginx -d ${CHAT_HOST} -d ${ID_HOST}
+#       (the ACME location block below keeps webroot renewals working)
+#    2. Uncomment the TLS server blocks at the bottom of this file, and the
+#       `return 301` lines in the port-80 blocks.
+#    3. If you use Cloudflare, set SSL/TLS mode to **Full (strict)**.
+#       "Flexible" is never the right answer here.
+# ===========================================================================
+
+# --- chat server (port 80) -------------------------------------------------
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${CHAT_HOST};
+
+    # Keep this reachable over plain HTTP even after you enable the redirect
+    # below, or certificate renewal breaks.
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    # Uncomment once the TLS block below is live:
+    # location / { return 301 https://$host$request_uri; }
+
+    client_max_body_size ${NGINX_MAX_BODY_MB}M;
+
+    location / {
+        proxy_pass http://127.0.0.1:8448;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # /sync long-polling. The server caps a long-poll at
+        # kMaxSyncTimeoutMs = 300s (protocol/include/bsfchat/Constants.h), so
+        # anything at or below 300s here cuts live connections mid-poll and
+        # clients see spurious disconnects. Must stay > 300s.
+        proxy_read_timeout 330s;
+        proxy_send_timeout 330s;
+
+        # Long-polls and media streaming should not sit in an nginx buffer.
+        proxy_buffering off;
+        proxy_request_buffering off;
+    }
+}
+
+# --- identity service (port 80) --------------------------------------------
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${ID_HOST};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    # Uncomment once the TLS block below is live:
+    # location / { return 301 https://$host$request_uri; }
+
+    location / {
+        proxy_pass http://127.0.0.1:8480;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+# ===========================================================================
+#  TLS server blocks — uncomment after certbot has issued the certificates.
+#  nginx will refuse to start if these are enabled before the cert files
+#  exist, which is why they ship commented out rather than active.
+# ===========================================================================
+#
+# server {
+#     listen 443 ssl;
+#     listen [::]:443 ssl;
+#     http2 on;
+#     server_name ${CHAT_HOST};
+#
+#     ssl_certificate     /etc/letsencrypt/live/${CHAT_HOST}/fullchain.pem;
+#     ssl_certificate_key /etc/letsencrypt/live/${CHAT_HOST}/privkey.pem;
+#     ssl_protocols TLSv1.2 TLSv1.3;
+#     ssl_prefer_server_ciphers off;
+#     add_header Strict-Transport-Security "max-age=31536000" always;
+#
+#     client_max_body_size ${NGINX_MAX_BODY_MB}M;
+#
+#     location / {
+#         proxy_pass http://127.0.0.1:8448;
+#         proxy_http_version 1.1;
+#         proxy_set_header Host $host;
+#         proxy_set_header X-Real-IP $remote_addr;
+#         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+#         proxy_set_header X-Forwarded-Proto $scheme;
+#         proxy_read_timeout 330s;   # > kMaxSyncTimeoutMs (300s)
+#         proxy_send_timeout 330s;
+#         proxy_buffering off;
+#         proxy_request_buffering off;
+#     }
+# }
+#
+# server {
+#     listen 443 ssl;
+#     listen [::]:443 ssl;
+#     http2 on;
+#     server_name ${ID_HOST};
+#
+#     ssl_certificate     /etc/letsencrypt/live/${ID_HOST}/fullchain.pem;
+#     ssl_certificate_key /etc/letsencrypt/live/${ID_HOST}/privkey.pem;
+#     ssl_protocols TLSv1.2 TLSv1.3;
+#     ssl_prefer_server_ciphers off;
+#     add_header Strict-Transport-Security "max-age=31536000" always;
+#
+#     location / {
+#         proxy_pass http://127.0.0.1:8480;
+#         proxy_http_version 1.1;
+#         proxy_set_header Host $host;
+#         proxy_set_header X-Real-IP $remote_addr;
+#         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+#         proxy_set_header X-Forwarded-Proto $scheme;
+#     }
+# }

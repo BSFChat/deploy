@@ -1,115 +1,180 @@
 # BSFChat Deployment
 
-Production docker-compose setup for deploying BSFChat to your own server.
+Production docker-compose setup for running BSFChat on your own server.
+
+There is exactly one file you edit: **`.env`**. Everything under `config/`
+and `nginx/` is generated from it by `./setup.sh`. That is deliberate — the
+chat server and the TURN relay share a secret, and a self-host that half
+works because two files drifted apart is worse than one that refuses to
+start.
 
 ## Quick Start
 
-1. Copy this `deploy/` directory to your server:
-   ```bash
-   scp -r deploy/ user@your-server:/opt/bsfchat/
-   ```
+```bash
+# 1. Copy this directory to your server
+scp -r deploy/ user@your-server:/opt/bsfchat/
+cd /opt/bsfchat
 
-2. On the server, create your `.env` file:
-   ```bash
-   cd /opt/bsfchat
-   cp .env.example .env
-   # Edit .env to set MINIO_ROOT_PASSWORD and your domains
-   ```
+# 2. Fill in your settings
+cp .env.example .env
+$EDITOR .env          # CHAT_HOST, ID_HOST, TURN_HOST, TURN_EXTERNAL_IP
 
-3. Edit the config files:
-   - `config/server.toml` — set `name`, `access_key`, `secret_key` (match Minio), and `provider_url`
-   - `config/identity.toml` — set `name` and `issuer_url`
+# 3. Generate the config (also generates the TURN secret)
+./setup.sh
 
-4. Start the services:
-   ```bash
-   docker compose up -d
-   ```
+# 4. Start
+docker compose up -d
+```
+
+`./setup.sh --check` re-validates `.env` and the generated files without
+writing anything. Re-run `./setup.sh` after **any** change to `.env`.
+
+### The two settings people get wrong
+
+- **`TURN_EXTERNAL_IP`** — your public IPv4 (`curl -4 https://ifconfig.me`).
+  Almost every VPS puts the guest behind a 1:1 NAT, so without this coturn
+  advertises a private address as the relay candidate and every relayed call
+  fails. There is no error anywhere: the allocation succeeds, the media goes
+  nowhere. `setup.sh` refuses to run without it.
+- **`CHAT_HOST`** — becomes the Matrix server name, and therefore part of
+  every user ID (`@you:chat.example.com`). Changing it later invalidates
+  existing accounts. Decide before your first start.
 
 ## What's Running
 
-- **bsfchat-server** (`localhost:8448`) — the chat server
-- **bsfchat-identity** (`localhost:8480`) — OIDC identity provider with web UI
-- **bsfchat-minio** (`localhost:9000`) — S3-compatible object storage for media
-  - Web console at `localhost:9001`
-- **bsfchat-coturn** (host network, port `3478`) — STUN/TURN relay for voice
+| Service | Address | Notes |
+| --- | --- | --- |
+| `bsfchat-server` | `127.0.0.1:8448` | chat server |
+| `bsfchat-identity` | `127.0.0.1:8480` | OIDC identity provider + web UI |
+| `bsfchat-coturn` | host network, `3478` | STUN/TURN relay for voice |
 
-All HTTP services bind to `127.0.0.1` only — use a reverse proxy for public
-access. coturn is the exception: it must be reachable directly (see Voice Chat
-below), never proxied.
+Both HTTP services bind to loopback only — put a reverse proxy in front.
+coturn is the exception: it must be reachable directly, and must never be
+proxied (TURN is not HTTP).
 
-## Reverse Proxy Setup
+There is no object-storage service. Media is stored on disk in
+`data/server/media/`, which is the right default for a self-hosted server:
+one fewer daemon to run, patch and back up. If you would rather use
+S3-compatible storage, uncomment the `[storage.s3]` block in
+`config/server.toml.template`, set `type = "s3"`, re-run `./setup.sh`, and
+bring your own endpoint.
 
-Point your proxy at the backend services. Example with Caddy:
+## Reverse Proxy
+
+`./setup.sh` renders `nginx/bsfchat.conf` with your domains filled in:
+
+```bash
+sudo cp nginx/bsfchat.conf /etc/nginx/sites-available/bsfchat
+sudo ln -s /etc/nginx/sites-available/bsfchat /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+**Read the header comment in that file before you go live.** As generated it
+listens on port 80 only, which is fine while you obtain a certificate and not
+fine afterwards. If you terminate TLS at Cloudflare with SSL/TLS mode
+"Flexible", the CDN-to-origin leg is plaintext HTTP across the public
+internet — every message, media upload and access token readable by anyone
+on that path. Get a certificate on the origin:
+
+```bash
+sudo certbot --nginx -d chat.example.com -d id.example.com
+```
+
+then uncomment the TLS blocks and the `return 301` redirects in the file, and
+set Cloudflare to **Full (strict)**.
+
+Two proxy settings are load-bearing and are generated from `.env` so they
+cannot drift:
+
+- `proxy_read_timeout 330s` — the server allows `/sync` long-polls up to
+  300s (`kMaxSyncTimeoutMs`). A shorter proxy timeout cuts them mid-poll and
+  clients see constant reconnects.
+- `client_max_body_size` — derived from `MAX_UPLOAD_MB`, with a little
+  headroom so an oversized upload is rejected by the server (proper JSON
+  error) rather than by nginx (bare HTML 413).
+
+Caddy equivalent, if you prefer it:
 
 ```
-chat.yourdomain.com {
-    reverse_proxy localhost:8448
+chat.example.com {
+    reverse_proxy localhost:8448 {
+        transport http { read_timeout 330s }
+    }
+    request_body { max_size 108MB }
 }
-
-id.yourdomain.com {
+id.example.com {
     reverse_proxy localhost:8480
-}
-```
-
-Example with nginx:
-
-```nginx
-server {
-    server_name chat.yourdomain.com;
-    listen 443 ssl http2;
-    # ... SSL config ...
-    location / {
-        proxy_pass http://127.0.0.1:8448;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 60s;  # for /sync long-polling
-    }
-}
-
-server {
-    server_name id.yourdomain.com;
-    listen 443 ssl http2;
-    # ... SSL config ...
-    location / {
-        proxy_pass http://127.0.0.1:8480;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
 }
 ```
 
 ## Voice Chat
 
-Voice needs a STUN/TURN server for NAT traversal — without TURN, users behind
-symmetric NAT or CGNAT can't connect at all. The compose file runs `coturn`
-for this (host networking, so no reverse proxy involved — TURN is not HTTP).
+Voice needs STUN and TURN. Without TURN, users behind symmetric NAT or CGNAT
+cannot connect at all. The bundled coturn provides both, so no third-party
+STUN server is involved and nothing about your calls leaves your box.
 
-1. Generate a secret: `openssl rand -hex 32`
-2. Set it in **both** places (they must match):
-   - `config/turnserver.conf` — `static-auth-secret`
-   - `config/server.toml` — `turn_secret` under `[voice]`
-3. In `config/turnserver.conf`, set `realm` to your domain, and set
-   `external-ip` if the server is behind NAT (typical cloud VPS)
-4. In `config/server.toml`, point `stun_uri`/`turn_uri` at your domain
-5. Open on your firewall:
-   - `3478` tcp + udp (STUN/TURN)
-   - `49160-49200` udp (media relay range)
+`setup.sh` generates the shared secret with `openssl rand -hex 32` and writes
+it to `.env`; compose passes it to coturn and renders it into
+`config/server.toml`. The server then hands clients short-lived credentials
+derived from it (`turn_ttl`, default 3600s) — there is no static TURN
+username or password to manage, and no placeholder that "works" until you hit
+a real NAT.
 
-The server issues short-lived TURN credentials from the shared secret
-(`turn_ttl`, default 3600s) — no static TURN username/password to manage.
+### Firewall
+
+```
+3478/tcp          STUN/TURN
+3478/udp          STUN/TURN
+49160-51160/udp   media relay range
+```
+
+The relay range genuinely needs to be that wide. WebRTC allocates one relay
+port per (peer connection x TURN URI), and two TURN URIs are advertised
+(udp + tcp transports), so a full-mesh call of N participants consumes
+`N * (N-1) * 2` ports:
+
+| Participants | Relay ports |
+| --- | --- |
+| 3 | 12 |
+| 5 | 40 |
+| 10 | 180 |
+| 20 | 760 |
+
+A range of a few dozen ports is exhausted by a single small call, after which
+allocations fail and calls silently never connect. `total-quota` and
+`user-quota` in `config/turnserver.conf.template` stop one client eating the
+range.
+
+Adjust with `TURN_MIN_PORT` / `TURN_MAX_PORT` in `.env` — `setup.sh` warns if
+you shrink the range below 500 ports, and prints the exact firewall rules to
+open.
+
+### Verifying it works
+
+```bash
+docker compose logs -f coturn      # look for "relay=<your public IP>"
+```
+
+Then place a call between two clients on different networks (not two tabs on
+the same LAN — that succeeds via host candidates and tells you nothing about
+TURN).
 
 ## Data Persistence
 
-All data is stored in `./data/`:
-- `data/server/` — chat database and (local) media
-- `data/identity/` — accounts database and RSA keys
-- `data/minio/` — S3 object storage
+Everything lives under `./data/`:
 
-Back this up regularly.
+- `data/server/` — `bsfchat.db` and media
+- `data/identity/` — `identity.db` and the OIDC RSA signing keys
+
+Both configs use **absolute** `/data/...` paths. A relative path here is a
+trap: the container's working directory is not the volume, so the database
+lands in the container's writable layer and is destroyed on the next
+`docker compose up`. For the identity service that would also regenerate the
+RSA signing key and invalidate every issued token.
+
+`data/identity/keys/private.pem` is a real private key. It is covered by
+`.gitignore`, but back it up somewhere encrypted — losing it logs everyone
+out permanently.
 
 ## Updating
 
@@ -117,6 +182,9 @@ Back this up regularly.
 docker compose pull
 docker compose up -d
 ```
+
+Pin `BSFCHAT_TAG` in `.env` to a release tag if you would rather upgrade
+deliberately than track `main`.
 
 ## Logs
 

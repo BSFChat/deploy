@@ -1,0 +1,99 @@
+# coturn config for BSFChat voice chat (WebRTC NAT traversal).
+#
+# GENERATED FILE — do not edit. Edit ../.env and re-run ./setup.sh.
+# The template lives at config/turnserver.conf.template.
+#
+# Note what is deliberately NOT in this file:
+#   * static-auth-secret  — passed on the command line from TURN_SECRET in
+#                           .env, so there is no placeholder secret that can
+#                           be left unchanged and no secret at rest here.
+#   * external-ip         — likewise, from TURN_EXTERNAL_IP in .env.
+# docker-compose.yml refuses to start coturn if either is unset.
+
+# ---------------------------------------------------------------------------
+# Listener
+# ---------------------------------------------------------------------------
+# Must match the turn_uri/stun_uri ports in config/server.toml.
+listening-port=${TURN_PORT}
+
+# The realm is used in the digest auth exchange (it is not DNS-resolved),
+# but it must be identical on both sides, so it is templated too.
+realm=${TURN_REALM}
+
+# Ephemeral credentials derived from a shared secret (coturn "REST API" auth).
+# The chat server signs short-lived username/password pairs with the same
+# secret; nothing static is ever handed to a client.
+use-auth-secret
+
+# ---------------------------------------------------------------------------
+# Relay port range  (see also: firewall notes in README.md)
+# ---------------------------------------------------------------------------
+# Sizing matters. WebRTC allocates one relay port per ICE candidate, i.e. per
+# (peer-connection x TURN URI). In a full-mesh call of N participants each
+# client holds N-1 peer connections, and config/server.toml advertises two
+# TURN URIs (udp + tcp transport), so a single client consumes
+#   (N-1) x 2 ports, and the whole call consumes N x (N-1) x 2.
+#
+#   5-way call  ->  40 relay ports
+#   10-way call ->  180 relay ports
+#   20-way call ->  760 relay ports
+#
+# The old 41-port range (49160-49200) was exhausted by ONE five-person call,
+# after which further allocations failed and calls silently never connected.
+# The default range below holds ~2000 ports: several concurrent large calls.
+min-port=${TURN_MIN_PORT}
+max-port=${TURN_MAX_PORT}
+
+# Backstops so one abusive client cannot exhaust the range for everyone.
+# total-quota is server-wide simultaneous allocations; user-quota is per
+# credential. 16 covers a 9-way mesh call (8 peers x 2 URIs) with the
+# ephemeral username a single client is issued.
+total-quota=1500
+user-quota=16
+
+# Only ever hand out UDP relay endpoints. Clients may still *reach* us over
+# TCP (turn:...?transport=tcp above) — this only forbids the relayed leg
+# itself being TCP, which WebRTC never wants and which costs a socket per
+# allocation.
+no-tcp-relay
+
+# ---------------------------------------------------------------------------
+# NAT
+# ---------------------------------------------------------------------------
+# external-ip comes from the command line (see docker-compose.yml). If it is
+# wrong or missing, coturn advertises the machine's *private* address as the
+# relay candidate and every relayed call fails — with no error anywhere,
+# because the allocation itself succeeds. This is the single most common
+# TURN misconfiguration; .env documents how to find the right value.
+
+# ---------------------------------------------------------------------------
+# Hardening
+# ---------------------------------------------------------------------------
+# A TURN server is, by construction, an open proxy. Without these denies
+# anyone on the internet can use it to reach hosts on your private network
+# and on cloud metadata endpoints.
+no-multicast-peers
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=100.64.0.0-100.127.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.0.0.0-192.0.0.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=198.18.0.0-198.19.255.255
+denied-peer-ip=240.0.0.0-255.255.255.255
+denied-peer-ip=::1
+denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+
+# We only listen on plaintext 3478; without these coturn tries to bring up
+# TLS/DTLS listeners on 5349, fails for want of certificates, and buries the
+# real startup errors in the noise. Public TLS is not needed here: WebRTC
+# media is SRTP-encrypted end to end regardless of the TURN transport.
+no-tls
+no-dtls
+
+fingerprint
+stale-nonce=600
+no-cli

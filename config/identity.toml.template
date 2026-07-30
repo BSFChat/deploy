@@ -1,0 +1,51 @@
+# BSFChat ID (OIDC identity provider) config.
+#
+# GENERATED FILE — do not edit. Edit ../.env and re-run ./setup.sh.
+# The template lives at config/identity.toml.template.
+
+[server]
+name = "${ID_HOST}"
+bind_address = "0.0.0.0"
+port = 8480
+# Must be the exact public HTTPS origin. OIDC clients compare the `iss`
+# claim against this string byte-for-byte, so a trailing slash, a http://
+# scheme or a bare hostname will fail discovery.
+issuer_url = "https://${ID_HOST}"
+
+[database]
+# Absolute, and inside the /data volume — see the note in server.toml.
+path = "/data/identity.db"
+
+[keys]
+# The RSA signing keypair for OIDC tokens. This MUST live on the volume:
+# if it lands in the container's writable layer, every `docker compose up`
+# regenerates it and silently invalidates every issued token and session.
+path = "/data/keys/"
+
+[auth]
+registration_enabled = ${REGISTRATION_ENABLED}
+
+# PBKDF2-HMAC-SHA256 iterations for newly stored passwords (OWASP guidance is
+# 600,000). Existing hashes record the cost they were created with and keep
+# verifying regardless; they are upgraded on the owner's next successful login.
+# Values below 100,000 are clamped up.
+password_hash_iterations = 600000
+
+# Send the `Secure` attribute on the session cookie. This deployment is served
+# over HTTPS by the reverse proxy, so leave it on.
+cookie_secure = true
+
+# Anti-bruteforce controls for /api/login and /api/login/2fa.
+login_rate_limit = 10        # requests per window, per source address
+login_rate_window = 300      # seconds
+login_max_failures = 8       # consecutive failures before a temporary lockout
+login_lockout_seconds = 900
+totp_max_attempts = 5        # wrong 2FA codes before the login token is burned
+
+[housekeeping]
+# How often expired sessions, auth codes, login tokens, consent requests and
+# refresh tokens are deleted.
+session_sweep_interval = 3600
+
+# NOTE: there is deliberately no [tls] section. This service speaks plain HTTP
+# and expects TLS to be terminated by the reverse proxy in front of it.

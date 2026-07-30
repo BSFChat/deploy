@@ -1,0 +1,94 @@
+# BSFChat chat server config.
+#
+# GENERATED FILE — do not edit. Edit ../.env and re-run ./setup.sh.
+# The template lives at config/server.toml.template.
+
+[server]
+# The Matrix server name — this ends up inside every user ID (@you:HOST),
+# so changing it later invalidates existing accounts. Get it right first.
+name = "${CHAT_HOST}"
+bind_address = "0.0.0.0"
+port = 8448
+workers = 4
+
+[database]
+# Absolute, and inside the /data volume mounted by docker-compose.yml.
+# A relative path here would put the database in the container's writable
+# layer, where it is destroyed on the next `docker compose up`.
+path = "/data/bsfchat.db"
+
+[media]
+path = "/data/media/"
+# Kept in lockstep with client_max_body_size in nginx/bsfchat.conf — both
+# are rendered from MAX_UPLOAD_MB in .env. If nginx's limit is lower, big
+# uploads fail at the proxy with a 413 that the server never sees.
+max_upload_size_mb = ${MAX_UPLOAD_MB}
+
+[auth]
+registration_enabled = ${REGISTRATION_ENABLED}
+password_hash_cost = 12
+
+# ---------------------------------------------------------------------------
+# Media storage
+# ---------------------------------------------------------------------------
+# "local" writes to [media].path inside the /data volume. That is the right
+# default for a self-hosted server: it works out of the box, it is one fewer
+# service to run and back up, and docker-compose.yml ships no object store.
+#
+# To use S3-compatible object storage instead (AWS S3, MinIO, Backblaze B2,
+# Contabo, Garage...), set type = "s3" and fill in the block below. You are
+# responsible for running/renting that endpoint — nothing in this compose
+# file provides one.
+[storage]
+type = "local"
+
+# [storage.s3]
+# endpoint = "https://s3.<region>.<provider>.tld"
+# access_key = "..."
+# secret_key = "..."
+# bucket = "bsfchat-media"
+# region = "us-east-1"
+# use_path_style = true
+
+# ---------------------------------------------------------------------------
+# Voice
+# ---------------------------------------------------------------------------
+[voice]
+enabled = true
+
+# STUN and TURN are both served by the bundled coturn — one host, no
+# third-party servers, no telemetry leaving your box.
+stun_uri = "stun:${TURN_HOST}:${TURN_PORT}"
+
+# TURN relay. Without it, users behind symmetric NAT or CGNAT cannot hear
+# each other even though the call reports "connected".
+#
+# Two URIs are advertised, so each peer connection allocates two relay
+# ports. That is accounted for in the coturn min-port/max-port range —
+# see config/turnserver.conf.template before trimming the range.
+turn_uri = [
+  "turn:${TURN_HOST}:${TURN_PORT}?transport=udp",
+  "turn:${TURN_HOST}:${TURN_PORT}?transport=tcp",
+]
+
+# Shared secret for ephemeral TURN credentials. Rendered from TURN_SECRET in
+# .env, the same value coturn is started with — they cannot drift, and there
+# is no placeholder here that "works" locally and fails across real NAT.
+turn_secret = "${TURN_SECRET}"
+# How long issued TURN credentials stay valid, in seconds.
+turn_ttl = 3600
+
+# Allow direct peer-to-peer as a fallback. Peers learn each other's IP, which
+# is normal for a Discord/Teamspeak-style chat and avoids paying relay
+# bandwidth for calls that do not need it. Set false to force every call
+# through coturn (privacy over cost) — only do that once you have confirmed
+# TURN actually works, or you turn off voice entirely.
+allow_peer_to_peer = ${ALLOW_PEER_TO_PEER}
+
+# ---------------------------------------------------------------------------
+# Identity (BSFChat ID / OIDC)
+# ---------------------------------------------------------------------------
+[identity]
+provider_url = "https://${ID_HOST}"
+required = false
+allow_local_accounts = true

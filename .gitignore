@@ -1,11 +1,22 @@
-# Runtime state — postgres data, minio buckets, media uploads,
-# letsencrypt certs etc. all land here at `docker compose up` time.
+# Runtime state — media uploads, sqlite databases, letsencrypt certs etc.
+# all land here at `docker compose up` time.
 # Lives on the production host, never in git.
 data/
 
 # The actual secrets file — only .env.example is checked in.
 .env
+.env.tmp
+
+# Config rendered by ./setup.sh from .env. The tracked sources are the
+# *.template files next to them. These MUST stay ignored: config/server.toml
+# contains the TURN shared secret, and committing a rendered config is how a
+# deployment's real domain and secret end up in a public repo.
+config/server.toml
+config/identity.toml
+config/turnserver.conf
+nginx/bsfchat.conf
 
 # Editor scratch
 *.swp
+*~
 .DS_Store

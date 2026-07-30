@@ -1,20 +1,22 @@
-# BSFChat production docker-compose
+# BSFChat production docker-compose.
 #
-# Deployment:
-#   1. Copy this file + config/ to your server
-#   2. Edit .env to set your domain and secrets
-#   3. Edit config/server.toml and config/identity.toml for your setup
-#   4. docker compose up -d
+#   cp .env.example .env && $EDITOR .env
+#   ./setup.sh            # renders config/*.toml + nginx/bsfchat.conf from .env
+#   docker compose up -d
 #
-# Put a reverse proxy (nginx, Caddy, Traefik) in front of this to terminate TLS.
-# Suggested routing:
-#   chat.yourdomain.com → localhost:8448 (chat server)
-#   id.yourdomain.com   → localhost:8480 (identity service)
-#   s3.yourdomain.com   → localhost:9000 (minio, optional — only if you want external media access)
+# .env is the only file you edit. Everything under config/ is generated from
+# it, so the chat server and coturn cannot drift out of sync — which is how
+# TURN ends up "configured" and silently non-functional.
+#
+# Put a reverse proxy in front of the HTTP services to terminate TLS;
+# nginx/bsfchat.conf is generated for you. Suggested routing:
+#   CHAT_HOST -> localhost:8448 (chat server)
+#   ID_HOST   -> localhost:8480 (identity service)
+# coturn is NOT proxied — TURN is not HTTP.
 
 services:
   server:
-    image: ghcr.io/bsfchat/server:main
+    image: ghcr.io/bsfchat/server:${BSFCHAT_TAG:-main}
     container_name: bsfchat-server
     restart: unless-stopped
     ports:
@@ -22,9 +24,17 @@ services:
     volumes:
       - ./data/server:/data
       - ./config/server.toml:/etc/bsfchat/server.toml:ro
+    healthcheck:
+      # The runtime image is a minimal ubuntu with no curl/wget, so this is a
+      # bash TCP-connect probe rather than an HTTP request.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8448"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
   identity:
-    image: ghcr.io/bsfchat/identity:main
+    image: ghcr.io/bsfchat/identity:${BSFCHAT_TAG:-main}
     container_name: bsfchat-identity
     restart: unless-stopped
     ports:
@@ -32,22 +42,51 @@ services:
     volumes:
       - ./data/identity:/data
       - ./config/identity.toml:/etc/bsfchat/identity.toml:ro
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8480"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
-  # coturn: TURN relay for voice chat NAT traversal. Without it, users behind
-  # symmetric NAT/CGNAT can't connect to voice at all — leave it enabled.
-  # Before starting: set static-auth-secret in config/turnserver.conf and the
-  # matching turn_secret in config/server.toml (they must be identical).
-  # Do NOT put this behind the reverse proxy — TURN is not HTTP.
-  # Open on your firewall: 3478 tcp+udp, 49160-49200 udp.
+  # coturn: STUN/TURN relay for voice NAT traversal. Without it, users behind
+  # symmetric NAT or CGNAT cannot connect to voice at all — leave it enabled.
+  #
+  # Firewall: TURN_PORT tcp+udp, plus the whole TURN_MIN_PORT-TURN_MAX_PORT
+  # udp relay range (~2000 ports by default). A call of N people allocates
+  # N*(N-1)*2 relay ports, so a range of a few dozen is exhausted by one
+  # small call and every subsequent allocation fails silently.
   coturn:
     # Pinned, not :latest — coturn is internet-facing and terminates
     # untrusted UDP/TCP. 4.11.0 clears the 2025-2026 advisories:
     # CVE-2025-69217 (predictable nonces via libc random()),
     # CVE-2026-43994 (OAuth-GCM stack overflow), CVE-2026-43915
     # (web-admin stored XSS). Bump deliberately, re-checking advisories.
-    image: coturn/coturn:4.11.0
+    image: coturn/coturn:${COTURN_TAG:-4.11.0}
     container_name: bsfchat-coturn
     restart: unless-stopped
-    network_mode: host  # coturn needs host networking for the relay port range
+    # Host networking: publishing ~2000 UDP ports through the bridge would
+    # spawn a userland proxy per port, and coturn would still advertise the
+    # container address as the relay candidate.
+    network_mode: host
     volumes:
       - ./config/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    # The two values that must never be guessed live in .env and are passed
+    # here rather than baked into turnserver.conf — so there is no secret at
+    # rest in a config file and no placeholder to leave unchanged. `:?` makes
+    # `docker compose up` abort with the message below rather than start a
+    # relay that looks healthy and drops all media.
+    command: >
+      -c /etc/coturn/turnserver.conf
+      --static-auth-secret=${TURN_SECRET:?TURN_SECRET is unset. Run ./setup.sh - it generates one and writes the matching value into config/server.toml.}
+      --external-ip=${TURN_EXTERNAL_IP:?TURN_EXTERNAL_IP is unset. Put this machine public IPv4 in .env (curl -4 https://ifconfig.me) and run ./setup.sh, or every relayed call fails silently.}
+    healthcheck:
+      # Unauthenticated STUN binding request against ourselves. turnutils_*
+      # ship inside the official coturn image; if a future tag drops them,
+      # this reports unhealthy while the relay is fine — check with
+      # `docker compose exec coturn command -v turnutils_stunclient`.
+      test: ["CMD-SHELL", "turnutils_stunclient -p ${TURN_PORT:-3478} 127.0.0.1 >/dev/null 2>&1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
