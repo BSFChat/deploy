@@ -93,6 +93,24 @@ cannot drift:
   headroom so an oversized upload is rejected by the server (proper JSON
   error) rather than by nginx (bare HTML 413).
 
+### Media ranges
+
+Media downloads support HTTP Range and stream in 64 KB chunks, so a range
+request costs its own size in memory rather than the size of the object. `HEAD`
+works and reads nothing from storage.
+
+One deviation worth knowing before you put a CDN in front of this: **a single
+`Range` header may ask for at most 4 ranges.** More than that is answered `416`
+with `Content-Range: bytes */<size>`, not served. Each range in a
+`multipart/byteranges` response is a separate storage read, so an unbounded
+count is a cheap request-amplification lever; RFC 9110 §14.2 explicitly permits
+refusing such a header. Apache and nginx allow considerably more, so a client or
+CDN that stitches many small ranges into one request will see `416` here where
+it saw `206` there. The cap is a compile-time constant
+(`kMaxRangeCount` in `server/src/api/MediaHandler.cpp`), not a config key.
+
+Zero-length uploads are refused with `400`.
+
 Caddy equivalent, if you prefer it:
 
 ```
