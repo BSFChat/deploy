@@ -93,6 +93,35 @@ cannot drift:
   headroom so an oversized upload is rejected by the server (proper JSON
   error) rather than by nginx (bare HTML 413).
 
+### Sizing the worker pool
+
+`workers` in `config/server.toml` counts concurrent **connections**, not
+concurrent requests, and it is the one setting that stalls the whole server
+rather than merely slowing it down when set too low.
+
+cpp-httplib runs an entire connection on one pool thread and holds that thread
+until the socket closes. `/sync` is a long poll that deliberately keeps its
+socket open, so every signed-in client parks a thread for the length of its
+poll — and holds further sockets for its voice poll, media and identity
+fetches. Budget roughly **4 connections per simultaneously connected client**.
+
+The default is 64 base threads with a ceiling of 512, which carries a
+ten-client deployment with room to spare. A thread parked on a long poll costs
+a stack and nothing else, so over-sizing this is far cheaper than
+under-sizing it.
+
+This mattered in practice: at the old default of `workers = 4`, two desktop
+clients were enough to hold every thread, and a message send then sat in the
+queue with nothing to run it until a long poll timed out. Measured on
+loopback, delivery went from 81 ms to **28.4 s**. If message delivery is
+erratic and the server is otherwise idle, this is the first thing to check.
+
+`max_workers` is a burst safety net rather than the mechanism: httplib only
+grows the pool when it sees zero idle threads at the instant a connection
+arrives, and the thread it spawns picks up the oldest queued connection rather
+than the one that triggered it. `workers` has to carry the steady load on its
+own.
+
 ### Media ranges
 
 Media downloads support HTTP Range and stream in 64 KB chunks, so a range

@@ -9,7 +9,12 @@
 name = "${CHAT_HOST}"
 bind_address = "0.0.0.0"
 port = 8448
-workers = 4
+# Concurrent CONNECTIONS the server can serve, not concurrent requests — see
+# "Sizing the worker pool" in ../README.md before lowering either of these.
+# Every signed-in client holds several sockets open at once, and a /sync long
+# poll holds its one for the length of the poll.
+workers = 64
+max_workers = 512
 
 [database]
 # Absolute, and inside the /data volume mounted by docker-compose.yml.
