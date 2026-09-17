@@ -4,6 +4,10 @@
 #   ./setup.sh            # renders config/*.toml + nginx/bsfchat.conf from .env
 #   docker compose up -d
 #
+# BSFCHAT_TAG in .env picks the release channel: `latest` (stable, the
+# default), `latest-beta` (stable + release candidates), `main`
+# (development), or a pinned tag. See README.md, "Switching channels".
+#
 # .env is the only file you edit. Everything under config/ is generated from
 # it, so the chat server and coturn cannot drift out of sync — which is how
 # TURN ends up "configured" and silently non-functional.
@@ -16,7 +20,7 @@
 
 services:
   server:
-    image: ghcr.io/bsfchat/server:${BSFCHAT_TAG:-main}
+    image: ghcr.io/bsfchat/server:${BSFCHAT_TAG:-latest}
     container_name: bsfchat-server
     restart: unless-stopped
     ports:
@@ -24,17 +28,14 @@ services:
     volumes:
       - ./data/server:/data
       - ./config/server.toml:/etc/bsfchat/server.toml:ro
-    healthcheck:
-      # The runtime image is a minimal ubuntu with no curl/wget, so this is a
-      # bash TCP-connect probe rather than an HTTP request.
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8448"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
+    # No healthcheck here on purpose: the image ships its own, which curls
+    # GET /_matrix/client/versions. The probe this block used to hold only
+    # opened a TCP connection, which a wedged server with every worker
+    # parked on a /sync long-poll still accepts. Overriding it here would
+    # put that weaker check back.
 
   identity:
-    image: ghcr.io/bsfchat/identity:${BSFCHAT_TAG:-main}
+    image: ghcr.io/bsfchat/identity:${BSFCHAT_TAG:-latest}
     container_name: bsfchat-identity
     restart: unless-stopped
     ports:
@@ -42,12 +43,8 @@ services:
     volumes:
       - ./data/identity:/data
       - ./config/identity.toml:/etc/bsfchat/identity.toml:ro
-    healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8480"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
+    # As above: the image's own healthcheck requests
+    # /.well-known/openid-configuration, which goes through the router.
 
   # coturn: STUN/TURN relay for voice NAT traversal. Without it, users behind
   # symmetric NAT or CGNAT cannot connect to voice at all — leave it enabled.

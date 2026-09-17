@@ -162,9 +162,51 @@ done
 
 mkdir -p data/server data/identity
 
+# The server and identity images run as uid/gid 10001, not root. A bind
+# mount keeps the HOST directory's ownership — it does not inherit the
+# ownership baked into the image — so without this the containers cannot
+# write their database, media or signing keys and fail at startup with a
+# permission error that reads like a bug in the application.
+#
+# Non-fatal: on a rootless-docker or userns-remap host the mapping is
+# different and chown will (correctly) refuse.
+if chown -R 10001:10001 data/server data/identity 2>/dev/null; then
+    note "data/server and data/identity are owned by uid 10001 (the container user)."
+else
+    note "WARNING: could not chown data/server and data/identity to 10001:10001."
+    note "         The containers run as uid 10001 and need to write there."
+    note "         Run:  sudo chown -R 10001:10001 data/server data/identity"
+    note "         (Ignore this if you run rootless docker or userns-remap.)"
+fi
+
+# ---------------------------------------------------------------------------
+# Release channel
+# ---------------------------------------------------------------------------
+# Say plainly which channel this deployment is on. BSFCHAT_TAG is a single
+# line in .env that decides whether you run reviewed releases or tip of
+# branch, and it is the setting most likely to be wrong without anyone
+# noticing until something breaks.
+case "$BSFCHAT_TAG" in
+    latest)
+        CHANNEL_NOTE="stable — the highest released version" ;;
+    latest-beta)
+        CHANNEL_NOTE="beta — stable plus release candidates" ;;
+    main)
+        CHANNEL_NOTE="DEVELOPMENT — tip of branch, unreviewed and untagged" ;;
+    v*)
+        CHANNEL_NOTE="pinned to this exact release; it will never move" ;;
+    *)
+        CHANNEL_NOTE="unrecognised. Expected latest, latest-beta, main or vX.Y.Z" ;;
+esac
+
 cat <<EOF
 
   Done.
+
+  Release channel: ${BSFCHAT_TAG}
+    ${CHANNEL_NOTE}
+    Change it with BSFCHAT_TAG in .env, then:
+      ./setup.sh && docker compose pull && docker compose up -d
 
   Next:
     1. Firewall — open ${TURN_PORT}/tcp, ${TURN_PORT}/udp and

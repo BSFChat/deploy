@@ -201,8 +201,86 @@ docker compose pull
 docker compose up -d
 ```
 
-Pin `BSFCHAT_TAG` in `.env` to a release tag if you would rather upgrade
-deliberately than track `main`.
+That pulls whatever your channel currently points at. Check what you got:
+
+```bash
+curl -s http://127.0.0.1:8448/_matrix/client/versions | jq .   # server
+curl -s http://127.0.0.1:8480/.well-known/openid-configuration | jq . # identity
+docker compose logs server | head -1
+```
+
+Both report a version, a revision and the channel they were built on.
+
+## Switching channels
+
+One setting, `BSFCHAT_TAG` in `.env`, applies to both the server and the
+identity service — they release together, and a stable server against a
+beta identity service is not a combination anyone tests.
+
+| `BSFCHAT_TAG` | Channel | What you get |
+| --- | --- | --- |
+| `latest` | **stable** | The highest released version. The default. |
+| `latest-beta` | **beta** | The highest of stable *or* release candidate. Never behind `latest`. |
+| `main` | development | Tip of branch, rebuilt on every push. Unreviewed. |
+| `v0.1.0` | pinned | That exact release, forever. |
+
+```bash
+$EDITOR .env          # BSFCHAT_TAG=latest-beta
+./setup.sh            # prints the channel it rendered
+docker compose pull
+docker compose up -d
+```
+
+`latest` follows the **highest** version, not the most recently published
+one. A hotfix cut on an older line gets its own `vX.Y.Z` tag and does not
+move `latest`, so a `docker compose pull` can never quietly downgrade you.
+`latest-beta` is stable *plus* release candidates, so a new stable release
+moves it too. The full rules are in `server/docs/release-channels.md`.
+
+If you run the beta channel, set the desktop client to the beta channel as
+well (Settings -> Updates), or testers will be running a stable client
+against an RC server.
+
+### Coming from an older install
+
+`latest` used to mean "tip of `main`" — it was pushed on every commit.
+It now means the newest stable release, and the old behaviour moved to
+`main`.
+
+So if your `.env` says `BSFCHAT_TAG=latest` and predates this change, your
+next `docker compose pull` moves you from tip-of-branch to the newest
+stable release. That is almost certainly what you want. If you were
+deliberately tracking the branch, set `BSFCHAT_TAG=main` before pulling.
+
+`COTURN_TAG` is unaffected: coturn is internet-facing and stays pinned to
+an exact version, never to a moving tag.
+
+### Rolling back
+
+Channel tags move forward. To go back, pin the version you know worked:
+
+```bash
+$EDITOR .env          # BSFCHAT_TAG=v0.1.0
+./setup.sh && docker compose up -d
+```
+
+Database schema migrations run forward on start and are **not** reversible,
+so rolling the image back does not roll the database back. Take a copy of
+`data/` before upgrading anything you cannot afford to lose.
+
+### File ownership
+
+The images run as uid/gid **10001**, not root. `./setup.sh` chowns
+`data/server` and `data/identity` to match. If it could not (it says so),
+do it yourself:
+
+```bash
+sudo chown -R 10001:10001 data/server data/identity
+```
+
+Otherwise the containers start, fail to open their database or write their
+signing keys, and report a permission error that reads like an application
+bug.
 
 ## Logs
 
