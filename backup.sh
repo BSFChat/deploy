@@ -47,13 +47,19 @@
 #       /tmp/bsfchat-<stamp>.tar.gz && shred -u /tmp/bsfchat-<stamp>.tar.gz
 #
 # Deliberately NOT included: /var/log/nginx. Those logs are not needed to
-# restore the service, and until the `bsfchat` log format in
-# nginx/bsfchat.conf.template is deployed they contain session tokens lifted
-# from media URLs — tokens whose expiry slides forward on use, so old lines can
-# still be live. Sweeping them into a retained archive would turn a
-# log-rotation problem into a backup-retention problem. If you have a separate
-# job that backs up /var/log, rotate the nginx logs first; see "Access logs" in
-# README.md.
+# restore the service, and they contain session tokens lifted from media URLs —
+# tokens whose expiry slides forward on use, so old lines can still be live.
+#
+# The access log stops collecting them once the `bsfchat` log format in
+# nginx/bsfchat.conf.template is deployed. The ERROR log does not: nginx has no
+# format control there and a token in the URL cannot be scrubbed out of it,
+# only suppressed, until signed media tickets take the token out of the URL
+# altogether. So this exclusion is not a transitional measure that expires with
+# the next nginx reload — keep it.
+#
+# Sweeping either log into a retained archive would turn a log-rotation problem
+# into a backup-retention problem. If you have a separate job that backs up
+# /var/log, rotate the nginx logs first; see "Access logs" in README.md.
 #
 # Also note: an archive taken before the RC's one-time VACUUM still contains
 # deleted-but-not-overwritten data — pre-hash plaintext access tokens dropped

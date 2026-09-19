@@ -393,7 +393,15 @@ Two things this does not do:
   sudo nginx -t && sudo systemctl reload nginx     # after installing the new conf
   sudo truncate -s 0 /var/log/nginx/access.log
   sudo rm -f /var/log/nginx/access.log.*.gz /var/log/nginx/access.log.?
+  sudo truncate -s 0 /var/log/nginx/error.log
+  sudo rm -f /var/log/nginx/error.log.*.gz /var/log/nginx/error.log.?
   ```
+
+  If your nginx config predates this template — hand-written under
+  `sites-enabled/` rather than rendered by `./setup.sh` — none of the above
+  reaches it. Copy the `map`, the `log_format` and the `access_log` lines into
+  it by hand, or the logs keep filling with tokens no matter how often you
+  rotate them.
 
   If you have any reason to think a copy of those logs left the host, make
   everyone re-authenticate as well. `./backup.sh` deliberately does not touch
@@ -401,9 +409,38 @@ Two things this does not do:
   problem — but if you have your own backup job that sweeps `/var/log`, its
   archives are in scope here too.
 
-- **The error log is not covered.** nginx records the full request line on a
-  4xx/5xx and there is no directive that scrubs it. Much lower volume, but
-  include `/var/log/nginx/error.log*` in the rotation above.
+- **The error log cannot be scrubbed, only suppressed.** This is a real
+  ceiling, so it is worth being exact about.
+
+  nginx's error log has no `log_format` equivalent. Its entries carry a
+  `, request: "GET /uri?... HTTP/1.1"` suffix built from the request line
+  exactly as received, and no directive changes it — a rewrite does not reach
+  it either. A token in the URL therefore cannot be scrubbed out of the error
+  log; it can only be kept out of the URL, or suppressed along with everything
+  else at that log level.
+
+  It is smaller than it sounds. At the default `error` level a routine 404 or
+  403 is not an error-log event at all. What writes an error-level entry *with*
+  the request line, on a request that may carry `?access_token=`, is a 413 past
+  `client_max_body_size` and an upstream failure or timeout — and both are
+  already rare here because of decisions already in the config: nginx's body
+  limit is rendered 8MB above the server's, so oversized uploads are refused by
+  the server with a JSON error rather than by nginx with a 413; and
+  `proxy_read_timeout` is 330s, above the server's 300s long-poll cap, so a
+  normal `/sync` does not become a 504. What is left is genuinely occasional —
+  a server restart or crash with media requests in flight logs one line per
+  in-flight request.
+
+  **The real fix is the token leaving the URL**, which arrives with signed media
+  tickets in the release after this one. Until then the only lever is
+  `error_log ... crit;`, which drops everything at `error` level and so costs
+  you the diagnostics for exactly the failures you would want to debug. It ships
+  commented out in `location /` for that reason. Turn it on only if you have
+  decided tokens-on-disk is the bigger risk for your deployment, and verify it
+  with the recipe in the file rather than assuming.
+
+  Either way, rotate `/var/log/nginx/error.log*` along with the access log
+  above. No config change retracts what is already written.
 
 One related thing not to do: **do not add security headers for media in nginx.**
 The chat server sets `X-Content-Type-Options`, `Content-Security-Policy`,
