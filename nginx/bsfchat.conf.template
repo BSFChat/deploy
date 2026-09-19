@@ -28,11 +28,130 @@
 #       "Flexible" is never the right answer here.
 # ===========================================================================
 
+# ===========================================================================
+#  ACCESS LOGGING — do not remove the `bsfchat` format below
+# ===========================================================================
+#  nginx's built-in `combined` format logs $request, which is the raw request
+#  line INCLUDING the query string. The desktop client fetches media with the
+#  session token as a query parameter — the image and video widgets cannot set
+#  an Authorization header — so every media request written by the default
+#  format puts a working bearer token on disk in /var/log/nginx/access.log,
+#  readable by anyone in the adm group and copied into every rotated archive.
+#
+#  The map below rewrites the URI for logging only: the request nginx proxies
+#  upstream is untouched, and $request_uri is still the real thing everywhere
+#  else. Only the logged copy is redacted.
+#
+#  This file is included from inside nginx.conf's `http { }` block, which is
+#  why `map` and `log_format` are legal at the top of it.
+#
+#  Three things to know:
+#
+#   1. Add `mt=` here when signed media tickets land. The token-out-of-URL work
+#      replaces ?access_token= with a short-lived ticket in a second query
+#      parameter, which is a smaller exposure but still a credential and still
+#      does not belong in a log line.
+#
+#   2. THE FIX IS FORWARD-ONLY. Every access log already written, and every
+#      rotated archive of one, contains live bearer tokens — and because token
+#      expiry slides forward on use, a line from last week can still work
+#      today. Rotating the logs is part of deploying this change, not an
+#      afterthought:
+#           sudo truncate -s 0 /var/log/nginx/access.log
+#           sudo rm -f /var/log/nginx/access.log.*.gz /var/log/nginx/access.log.?
+#      Then make everyone re-authenticate if you have any reason to think a
+#      copy left the host. See "Backup and restore" in ../README.md —
+#      ./backup.sh deliberately does not sweep up /var/log, precisely so it
+#      cannot turn a log-rotation problem into a backup-retention problem.
+#
+#   3. The ERROR log is a residual this cannot fully close. Read on.
+#
+# ===========================================================================
+#  ERROR LOGGING — what is left, and why it is not fixed here
+# ===========================================================================
+#  The map above fixes the access log and nothing else. nginx's error log has
+#  no `log_format` equivalent: entries carry a `, request: "GET /uri?... HTTP/
+#  1.1"` suffix built from the request line exactly as it arrived, and no
+#  directive changes it. Rewrites do not reach it either — an internal rewrite
+#  changes the URI nginx works with, not the request line it received and
+#  reports. So a token in the URL cannot be scrubbed out of the error log. It
+#  can only be prevented from getting into the URL, or suppressed.
+#
+#  Be precise about the exposure, because "every 4xx writes a token" is wrong.
+#  At the default `error` level a routine 404 or 403 is not an error-log event
+#  at all — those are access-log only. What does write an error-level entry
+#  WITH the request line, on a request that may carry ?access_token=:
+#
+#    * 413, when a body exceeds client_max_body_size
+#        ("client intended to send too large body")
+#    * 502/504 and friends, when the upstream fails or times out
+#        ("upstream timed out", "connect() failed", "upstream prematurely
+#         closed connection")
+#
+#  Both are already rare here, and not by accident — two existing decisions in
+#  this file happen to be the mitigation:
+#
+#    * client_max_body_size is rendered at MAX_UPLOAD_MB + 8 (setup.sh), so an
+#      oversized upload is refused by the SERVER with a JSON error rather than
+#      by nginx with a 413. The 413 path is reached only by a body larger than
+#      the server's own limit plus 8MB.
+#    * proxy_read_timeout is 330s, above the server's 300s long-poll cap, so a
+#      /sync long poll completing normally does not become a 504.
+#
+#  What is left is genuinely occasional: a restart or crash of the chat server
+#  while media requests are in flight, which logs one line per in-flight
+#  request, with the token. Low volume, not zero, and every one of those tokens
+#  is live — expiry slides forward on use, so an old line can still work.
+#
+#  THE REAL FIX IS THE TOKEN LEAVING THE URL. Signed media tickets replace
+#  ?access_token= with a short-lived, single-purpose ticket; that is scheduled
+#  for the release after this one. When it lands, add `mt=` to the map above
+#  AND revisit this block — a ticket in an error-log line is a much smaller
+#  problem than a session token, but it is still a credential on disk.
+#
+#  Until then, the one lever available is suppression, and it costs you the
+#  diagnostics for exactly the failures you would want to debug. It is NOT
+#  enabled by default: a media path that fails silently is its own incident,
+#  and this is a low-volume residue with a scheduled fix. Enable it only if you
+#  have decided tokens-on-disk is the bigger risk for your deployment.
+#
+#  To suppress, uncomment the error_log line in the chat server's `location /`
+#  below. `crit` keeps crit/alert/emerg and drops everything at `error`,
+#  including the two cases above. It applies to the whole proxied chat API, so
+#  you also lose upstream diagnostics for /sync, /login and everything else.
+#  If that is too blunt, split the media paths into their own location — a copy
+#  of `location /` at `/_matrix/media/` with the raised error_log — and accept
+#  that the two blocks now have to be kept in step by hand.
+#
+#  Whichever you choose, VERIFY IT. Stop the chat server, request a media URL
+#  with a token, and confirm nothing landed in error.log:
+#      docker compose stop server
+#      curl -s -o /dev/null 'http://127.0.0.1/_matrix/media/v3/download/x/y?access_token=VERIFYME'
+#      docker compose start server
+#      sudo grep -c VERIFYME /var/log/nginx/error.log      # want: 0
+#
+#  And rotate what is already there, the same as the access log — see item 2.
+#  Existing error.log archives hold tokens no config change can retract:
+#      sudo truncate -s 0 /var/log/nginx/error.log
+#      sudo rm -f /var/log/nginx/error.log.*.gz /var/log/nginx/error.log.?
+# ===========================================================================
+
+map $request_uri $loggable_uri {
+    ~^(?<clean>[^?]*)\?(.*&)?access_token=[^&]*(&(?<rest>.*))?$  "$clean?<redacted>";
+    default                                                      $request_uri;
+}
+
+log_format bsfchat '$remote_addr - $remote_user [$time_local] '
+                   '"$request_method $loggable_uri $server_protocol" '
+                   '$status $body_bytes_sent "$http_referer" "$http_user_agent"';
+
 # --- chat server (port 80) -------------------------------------------------
 server {
     listen 80;
     listen [::]:80;
     server_name ${CHAT_HOST};
+
+    access_log /var/log/nginx/access.log bsfchat;
 
     # Keep this reachable over plain HTTP even after you enable the redirect
     # below, or certificate renewal breaks.
@@ -46,6 +165,13 @@ server {
     client_max_body_size ${NGINX_MAX_BODY_MB}M;
 
     location / {
+        # Uncomment to keep session tokens out of the error log, at the cost of
+        # every error-level diagnostic for the chat API (413s, upstream
+        # failures and timeouts). Read "ERROR LOGGING" at the top of this file
+        # first — this is a deliberate trade, not a free win, and the real fix
+        # arrives with signed media tickets.
+        # error_log /var/log/nginx/error.log crit;
+
         proxy_pass http://127.0.0.1:8448;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -71,6 +197,8 @@ server {
     listen 80;
     listen [::]:80;
     server_name ${ID_HOST};
+
+    access_log /var/log/nginx/access.log bsfchat;
 
     location /.well-known/acme-challenge/ {
         root /var/www/html;
@@ -101,15 +229,29 @@ server {
 #     http2 on;
 #     server_name ${CHAT_HOST};
 #
+#     access_log /var/log/nginx/access.log bsfchat;
+#
 #     ssl_certificate     /etc/letsencrypt/live/${CHAT_HOST}/fullchain.pem;
 #     ssl_certificate_key /etc/letsencrypt/live/${CHAT_HOST}/privkey.pem;
 #     ssl_protocols TLSv1.2 TLSv1.3;
 #     ssl_prefer_server_ciphers off;
 #     add_header Strict-Transport-Security "max-age=31536000" always;
 #
+#     # Do NOT add security headers for media here. The chat server sets
+#     # X-Content-Type-Options, Content-Security-Policy, X-Frame-Options,
+#     # Referrer-Policy and Cross-Origin-Resource-Policy on media responses
+#     # itself, with the per-response values that path needs. An `add_header`
+#     # in a location REPLACES the whole inherited set rather than adding to
+#     # it, so a well-meaning copy here both drops headers the app set and
+#     # emits a duplicate X-Content-Type-Options, which some clients treat as
+#     # malformed. Leave media's headers to the application.
+#
 #     client_max_body_size ${NGINX_MAX_BODY_MB}M;
 #
 #     location / {
+#         # See "ERROR LOGGING" at the top of this file before enabling:
+#         # error_log /var/log/nginx/error.log crit;
+#
 #         proxy_pass http://127.0.0.1:8448;
 #         proxy_http_version 1.1;
 #         proxy_set_header Host $host;
@@ -128,6 +270,8 @@ server {
 #     listen [::]:443 ssl;
 #     http2 on;
 #     server_name ${ID_HOST};
+#
+#     access_log /var/log/nginx/access.log bsfchat;
 #
 #     ssl_certificate     /etc/letsencrypt/live/${ID_HOST}/fullchain.pem;
 #     ssl_certificate_key /etc/letsencrypt/live/${ID_HOST}/privkey.pem;

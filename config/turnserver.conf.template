@@ -3,12 +3,24 @@
 # GENERATED FILE — do not edit. Edit ../.env and re-run ./setup.sh.
 # The template lives at config/turnserver.conf.template.
 #
-# Note what is deliberately NOT in this file:
-#   * static-auth-secret  — passed on the command line from TURN_SECRET in
-#                           .env, so there is no placeholder secret that can
-#                           be left unchanged and no secret at rest here.
-#   * external-ip         — likewise, from TURN_EXTERNAL_IP in .env.
-# docker-compose.yml refuses to start coturn if either is unset.
+# This file contains the TURN shared secret. It is rendered from TURN_SECRET in
+# .env, is excluded by .gitignore, and setup.sh gives it mode 0640 owned by the
+# uid coturn runs as. Do not copy it anywhere it would be world-readable.
+#
+# It used to be passed on coturn's command line instead, to keep "no secret at
+# rest in a config file". That traded one exposure for a worse one: coturn runs
+# with network_mode: host, so its argv is readable by every local user and every
+# member of the `docker` group via `ps aux`, /proc/<pid>/cmdline, `docker
+# inspect` and `docker compose config`. A file with a mode on it is reachable by
+# root and by coturn; argv is reachable by everyone. Anyone holding this secret
+# can mint unlimited valid TURN credentials and relay their own traffic through
+# your IP address.
+#
+# Still deliberately NOT in this file:
+#   * external-ip  — passed on the command line from TURN_EXTERNAL_IP in .env.
+#                    It is a public IP address, not a secret, so the process
+#                    table is a fine place for it, and docker-compose.yml's
+#                    `:?` guard refuses to start coturn when it is unset.
 
 # ---------------------------------------------------------------------------
 # Listener
@@ -24,6 +36,16 @@ realm=${TURN_REALM}
 # The chat server signs short-lived username/password pairs with the same
 # secret; nothing static is ever handed to a client.
 use-auth-secret
+
+# The shared secret itself. The identical value is rendered into
+# turn_secret in config/server.toml from the same TURN_SECRET in .env, so the
+# two cannot drift — a mismatch here means every credential the chat server
+# issues is rejected and all relayed calls fail with no useful error.
+#
+# To rotate: change TURN_SECRET in .env, re-run ./setup.sh, then restart BOTH
+# coturn and the chat server. In-flight allocations keep working until their
+# TTL expires; credentials already handed to clients stop being accepted.
+static-auth-secret=${TURN_SECRET}
 
 # ---------------------------------------------------------------------------
 # Relay port range  (see also: firewall notes in README.md)

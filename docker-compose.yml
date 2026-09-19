@@ -68,14 +68,27 @@ services:
     network_mode: host
     volumes:
       - ./config/turnserver.conf:/etc/coturn/turnserver.conf:ro
-    # The two values that must never be guessed live in .env and are passed
-    # here rather than baked into turnserver.conf — so there is no secret at
-    # rest in a config file and no placeholder to leave unchanged. `:?` makes
-    # `docker compose up` abort with the message below rather than start a
-    # relay that looks healthy and drops all media.
+    # The image runs as nobody:nogroup (65534), not root. ./setup.sh chowns the
+    # rendered turnserver.conf to that uid and gives it mode 0640, because the
+    # file now carries the TURN shared secret. If coturn exits complaining it
+    # cannot read its config, that chown is what failed — setup.sh says so when
+    # it cannot do it.
+    #
+    # static-auth-secret is NOT passed here. It used to be, on the reasoning
+    # that a secret in argv beats a secret at rest — but with network_mode:
+    # host, argv is readable by every local user through `ps aux`,
+    # /proc/<pid>/cmdline, `docker inspect` and `docker compose config`, which
+    # is strictly worse than a 0640 file. It lives in turnserver.conf now; see
+    # the note at the top of config/turnserver.conf.template.
+    #
+    # external-ip stays here: it is a public IP, not a secret, and the `:?`
+    # guard makes `docker compose up` abort with the message below rather than
+    # start a relay that looks healthy and silently drops all media. The
+    # equivalent guard for TURN_SECRET now lives in ./setup.sh, which generates
+    # the secret and refuses to render a config without one — and which you
+    # have to run before this file works at all.
     command: >
       -c /etc/coturn/turnserver.conf
-      --static-auth-secret=${TURN_SECRET:?TURN_SECRET is unset. Run ./setup.sh - it generates one and writes the matching value into config/server.toml.}
       --external-ip=${TURN_EXTERNAL_IP:?TURN_EXTERNAL_IP is unset. Put this machine public IPv4 in .env (curl -4 https://ifconfig.me) and run ./setup.sh, or every relayed call fails silently.}
     healthcheck:
       # Unauthenticated STUN binding request against ourselves. turnutils_*
