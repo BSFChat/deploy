@@ -327,6 +327,92 @@ or a container on a user-defined network — replace that entry with the proxy's
 actual address. Never `0.0.0.0/0`: that lets any client pick its own rate-limit
 bucket and the limiter stops existing.
 
+## Push notifications
+
+Off by default, because nothing in `docker-compose.yml` provides a push
+gateway. Turning it on means running one (sygnal or equivalent, holding your
+FCM/APNs credentials) and then telling this server that it, and only it, is an
+acceptable destination.
+
+That allowlist is a security control, not a convenience setting.
+`POST /_matrix/client/v3/pushers/set` is the one endpoint where an ordinary
+user hands the server a URL and the server then makes outbound POSTs carrying
+message data to it. With no allowlist that is a self-serve exfiltration feed
+and a server-side request forgery primitive in the same request.
+
+So an **empty `allowed_gateway_prefixes` now means no gateway is permitted**,
+not "any gateway". If `push.enabled` is true with an empty list the server logs
+an error and disables push. It still starts — an upgrade must not brick a
+deployment over a key that did not exist in the previous release — but push
+will not work until the list is set.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `enabled` | `false` | Master switch. |
+| `allowed_gateway_prefixes` | *(empty — nothing permitted)* | URL prefixes a client may register. Matched on scheme + host + port and then on a path-segment boundary, so `https://push.example.org` does **not** also authorise `https://push.example.org.attacker.tld/`. |
+| `allow_internal_gateway` | `false` | Whether a gateway resolving to a private, loopback, link-local or otherwise internal address is allowed at all. |
+| `default_payload` | `"event_id_only"` | What goes in the notification. `"full"` sends message bodies to the gateway operator. |
+
+Two things to get right:
+
+**A gateway inside this compose file needs both settings.** The internal-address
+check applies *on top of* the allowlist, not only when the allowlist is empty —
+so listing `http://sygnal:5000/...` is not sufficient on its own. You also need
+`allow_internal_gateway = true`. That check was rewritten after seven ways round
+it were found (`0177.0.0.1`, `0x7f.0.0.1`, `127.1`, `localhost.`, IPv4-mapped
+IPv6 among them), so do not expect a clever spelling to work as a shortcut —
+set the flag.
+
+**`default_payload = "full"` sends message text off your server.** Whoever runs
+the gateway sees it, and so does Google or Apple downstream. `event_id_only`
+sends an identifier and lets the client fetch the message itself over its own
+authenticated connection. Change it only if you run the gateway and have
+decided you are comfortable with that.
+
+## Access logs
+
+`nginx/bsfchat.conf.template` defines a `bsfchat` log format and uses it in
+every server block. Do not drop it and do not replace it with `combined`.
+
+nginx's built-in `combined` format logs the raw request line including the
+query string, and the desktop client fetches media with the session token as a
+query parameter — the image and video widgets cannot set an `Authorization`
+header. With the default format, `/var/log/nginx/access.log` is a file of
+working bearer tokens, readable by anyone in the `adm` group and copied into
+every rotated archive. The `map` in the template rewrites the URI **for logging
+only**; what nginx proxies upstream is untouched.
+
+Two things this does not do:
+
+- **It is forward-only.** Every access log already written on this host, and
+  every rotated archive of one, still contains live tokens — and because token
+  expiry slides forward on use, a line from last week can still work today.
+  Rotating them is part of deploying this change:
+
+  ```bash
+  sudo nginx -t && sudo systemctl reload nginx     # after installing the new conf
+  sudo truncate -s 0 /var/log/nginx/access.log
+  sudo rm -f /var/log/nginx/access.log.*.gz /var/log/nginx/access.log.?
+  ```
+
+  If you have any reason to think a copy of those logs left the host, make
+  everyone re-authenticate as well. `./backup.sh` deliberately does not touch
+  `/var/log`, so it cannot turn a log-rotation problem into a backup-retention
+  problem — but if you have your own backup job that sweeps `/var/log`, its
+  archives are in scope here too.
+
+- **The error log is not covered.** nginx records the full request line on a
+  4xx/5xx and there is no directive that scrubs it. Much lower volume, but
+  include `/var/log/nginx/error.log*` in the rotation above.
+
+One related thing not to do: **do not add security headers for media in nginx.**
+The chat server sets `X-Content-Type-Options`, `Content-Security-Policy`,
+`X-Frame-Options`, `Referrer-Policy` and `Cross-Origin-Resource-Policy` on media
+responses itself. An `add_header` inside a `location` replaces the whole
+inherited set rather than adding to it, so a well-meaning copy in nginx both
+drops headers the application set and emits a duplicate
+`X-Content-Type-Options`. Leave those to the app.
+
 ## Backup and restore
 
 `./backup.sh` is the supported path. `cp`, `rsync` and `tar` are not.
@@ -559,3 +645,7 @@ world-readable since.
 docker compose logs -f           # all services
 docker compose logs -f server    # just the chat server
 ```
+
+These are the application logs. The reverse proxy's access logs are a separate
+thing with a separate hazard — see "Access logs" above before you copy them
+anywhere.

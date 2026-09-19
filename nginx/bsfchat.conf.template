@@ -28,11 +28,63 @@
 #       "Flexible" is never the right answer here.
 # ===========================================================================
 
+# ===========================================================================
+#  ACCESS LOGGING — do not remove the `bsfchat` format below
+# ===========================================================================
+#  nginx's built-in `combined` format logs $request, which is the raw request
+#  line INCLUDING the query string. The desktop client fetches media with the
+#  session token as a query parameter — the image and video widgets cannot set
+#  an Authorization header — so every media request written by the default
+#  format puts a working bearer token on disk in /var/log/nginx/access.log,
+#  readable by anyone in the adm group and copied into every rotated archive.
+#
+#  The map below rewrites the URI for logging only: the request nginx proxies
+#  upstream is untouched, and $request_uri is still the real thing everywhere
+#  else. Only the logged copy is redacted.
+#
+#  This file is included from inside nginx.conf's `http { }` block, which is
+#  why `map` and `log_format` are legal at the top of it.
+#
+#  Three things to know:
+#
+#   1. Add `mt=` here when signed media tickets land. The token-out-of-URL work
+#      replaces ?access_token= with a short-lived ticket in a second query
+#      parameter, which is a smaller exposure but still a credential and still
+#      does not belong in a log line.
+#
+#   2. THE FIX IS FORWARD-ONLY. Every access log already written, and every
+#      rotated archive of one, contains live bearer tokens — and because token
+#      expiry slides forward on use, a line from last week can still work
+#      today. Rotating the logs is part of deploying this change, not an
+#      afterthought:
+#           sudo truncate -s 0 /var/log/nginx/access.log
+#           sudo rm -f /var/log/nginx/access.log.*.gz /var/log/nginx/access.log.?
+#      Then make everyone re-authenticate if you have any reason to think a
+#      copy left the host. See "Backup and restore" in ../README.md —
+#      ./backup.sh deliberately does not sweep up /var/log, precisely so it
+#      cannot turn a log-rotation problem into a backup-retention problem.
+#
+#   3. Residual: nginx's ERROR log still records the full request line on a
+#      4xx/5xx, and there is no directive that scrubs it. It is much lower
+#      volume, but include it in the rotation above.
+# ===========================================================================
+
+map $request_uri $loggable_uri {
+    ~^(?<clean>[^?]*)\?(.*&)?access_token=[^&]*(&(?<rest>.*))?$  "$clean?<redacted>";
+    default                                                      $request_uri;
+}
+
+log_format bsfchat '$remote_addr - $remote_user [$time_local] '
+                   '"$request_method $loggable_uri $server_protocol" '
+                   '$status $body_bytes_sent "$http_referer" "$http_user_agent"';
+
 # --- chat server (port 80) -------------------------------------------------
 server {
     listen 80;
     listen [::]:80;
     server_name ${CHAT_HOST};
+
+    access_log /var/log/nginx/access.log bsfchat;
 
     # Keep this reachable over plain HTTP even after you enable the redirect
     # below, or certificate renewal breaks.
@@ -72,6 +124,8 @@ server {
     listen [::]:80;
     server_name ${ID_HOST};
 
+    access_log /var/log/nginx/access.log bsfchat;
+
     location /.well-known/acme-challenge/ {
         root /var/www/html;
     }
@@ -101,11 +155,22 @@ server {
 #     http2 on;
 #     server_name ${CHAT_HOST};
 #
+#     access_log /var/log/nginx/access.log bsfchat;
+#
 #     ssl_certificate     /etc/letsencrypt/live/${CHAT_HOST}/fullchain.pem;
 #     ssl_certificate_key /etc/letsencrypt/live/${CHAT_HOST}/privkey.pem;
 #     ssl_protocols TLSv1.2 TLSv1.3;
 #     ssl_prefer_server_ciphers off;
 #     add_header Strict-Transport-Security "max-age=31536000" always;
+#
+#     # Do NOT add security headers for media here. The chat server sets
+#     # X-Content-Type-Options, Content-Security-Policy, X-Frame-Options,
+#     # Referrer-Policy and Cross-Origin-Resource-Policy on media responses
+#     # itself, with the per-response values that path needs. An `add_header`
+#     # in a location REPLACES the whole inherited set rather than adding to
+#     # it, so a well-meaning copy here both drops headers the app set and
+#     # emits a duplicate X-Content-Type-Options, which some clients treat as
+#     # malformed. Leave media's headers to the application.
 #
 #     client_max_body_size ${NGINX_MAX_BODY_MB}M;
 #
@@ -128,6 +193,8 @@ server {
 #     listen [::]:443 ssl;
 #     http2 on;
 #     server_name ${ID_HOST};
+#
+#     access_log /var/log/nginx/access.log bsfchat;
 #
 #     ssl_certificate     /etc/letsencrypt/live/${ID_HOST}/fullchain.pem;
 #     ssl_certificate_key /etc/letsencrypt/live/${ID_HOST}/privkey.pem;

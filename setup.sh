@@ -77,6 +77,14 @@ case "$TURN_HOST" in
     *example.com|*yourdomain.com)
         die "TURN_HOST is still the placeholder ($TURN_HOST). Set your real domain in .env." ;;
 esac
+# TURN_REALM was not checked here, so a .env that left it at the placeholder
+# rendered "successfully" and only failed later in --check, which most people
+# never run. Same class of mistake as the three above; same treatment.
+case "$TURN_REALM" in
+    *example.com|*yourdomain.com)
+        die "TURN_REALM is still the placeholder ($TURN_REALM). It must match the
+         realm the chat server uses, which is CHAT_HOST. Set it in .env." ;;
+esac
 
 # TURN_EXTERNAL_IP: the single most commonly skipped setting, and skipping it
 # breaks every relayed call with no error anywhere. Refuse to render without it.

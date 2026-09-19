@@ -62,26 +62,27 @@ registration_enabled = ${REGISTRATION_ENABLED}
 password_hash_cost = 19
 
 # Whose X-Forwarded-For the server believes when rate-limiting /login and
-# /register.
-#
-# nginx runs on the HOST and reaches this container through the published
-# 127.0.0.1:8448 port, so the peer address the server actually sees is the
-# Docker bridge gateway (172.x.0.1) — not loopback. The server ignores
-# X-Forwarded-For from any peer not listed here, which is correct (otherwise
-# any client could spoof its own address and defeat the limiter) but means
-# that without the 172.16/12 entry EVERY request looks like it came from one
-# address: all users share a single rate-limit bucket, and one person
-# retrying a bad password locks the whole server out of signing in.
-#
-# Safe because the container port is published on 127.0.0.1 only — nothing
-# off this machine can reach the server from that range, so nothing off this
-# machine can present a forged X-Forwarded-For that is believed.
-#
-# If you put something other than the bundled nginx in front — a proxy on
-# another host, or a container on a user-defined network — replace the
-# 172.16/12 entry with that proxy's actual address. Do not add 0.0.0.0/0.
-# Unparseable entries fail startup rather than being silently dropped.
+# /register. nginx runs on the HOST and reaches this container through the
+# published 127.0.0.1:8448 port, so the peer the server sees is the Docker
+# bridge gateway (172.x.0.1) — not loopback. Without the 172.16/12 entry every
+# user shares one rate-limit bucket and one abusive client can lock everybody
+# out of signing in. Safe because the port is published on 127.0.0.1 only:
+# nothing but this host can reach the container from that range.
 # (Ignored by server versions that predate auth rate limiting.)
+#
+# The other half of that: X-Forwarded-For from a peer NOT listed here is always
+# ignored. That is deliberate — otherwise any client could name its own address
+# and pick a fresh rate-limit bucket per request — but it is also why the
+# symptom of getting this list wrong is a limiter that quietly applies to
+# everyone at once instead of an error.
+#
+# So the list is a statement about which peers cannot forge a client address,
+# and 172.16/12 only qualifies because of the 127.0.0.1 publish rule above. If
+# you put something other than the bundled nginx in front — a proxy on another
+# host, or a container on a user-defined network — replace that entry with the
+# proxy's actual address. Never 0.0.0.0/0: that trusts every client to identify
+# itself and the limiter stops existing. Unparseable entries fail startup
+# rather than being silently dropped.
 trusted_proxies = ["127.0.0.0/8", "::1", "172.16.0.0/12"]
 
 # ---------------------------------------------------------------------------
@@ -148,3 +149,28 @@ allow_peer_to_peer = ${ALLOW_PEER_TO_PEER}
 provider_url = "https://${ID_HOST}"
 required = false
 allow_local_accounts = true
+
+# ---------------------------------------------------------------------------
+# Push notifications
+# ---------------------------------------------------------------------------
+# Nothing in docker-compose.yml provides a push gateway, so this ships off.
+#
+# Read the enabled = false comment before turning it on: /pushers/set is the
+# one endpoint where an ordinary user hands this server a URL and this server
+# then POSTs message data to it, which makes the allowlist a security control
+# rather than a convenience. README.md, "Push notifications", has the rest —
+# in particular why a gateway running inside this compose file needs TWO
+# settings, not one.
+
+[push]
+# No push gateway is deployed. Push notifications are off.
+# To enable: run sygnal (or equivalent), then set enabled = true and point
+# allowed_gateway_prefixes at it. An empty allowlist means NO gateway is
+# permitted — the server logs an error and disables push — because
+# /pushers/set is the one endpoint where a user names a URL this server
+# POSTs message data to.
+enabled = false
+
+# allowed_gateway_prefixes = ["https://push.${CHAT_HOST}/_matrix/push/v1/"]
+# allow_internal_gateway = false   # true if sygnal runs inside compose
+# default_payload = "event_id_only"  # "full" sends message bodies to the gateway
