@@ -175,8 +175,24 @@ snapshot() {
     [ -f "$src" ] || { note "skipped $src (does not exist)"; return 0; }
     sqlite3 "$src" ".timeout 30000" ".backup '$dst'" ||
         die "sqlite3 .backup failed for $src. Nothing was written."
-    # The copy is a plain, checkpointed file with no WAL beside it. Confirm it
-    # is a database and not, say, 40MB of zeroes, before calling this a backup.
+    # Confirm the copy is a database and not, say, 40MB of zeroes, before
+    # calling this a backup.
+    #
+    # Note the side effect, because the archive shows it: .backup writes a
+    # single checkpointed file, but that file inherits WAL journal mode from
+    # the source, and this integrity_check opens it read-write, which
+    # materialises -wal and -shm beside it. Each database is therefore three
+    # files by the time the staging directory is tarred, not one. Left alone
+    # on purpose:
+    #   * the -wal is 0 bytes. integrity_check only reads, so nothing is
+    #     committed through this connection and no transaction hides in it;
+    #   * -shm is an index into the -wal, rebuilt on the next open and never
+    #     authoritative;
+    #   * both are created under this script's umask 077 inside the 0700
+    #     staging directory, so they expose nothing the archive does not.
+    # A restore is identical either way: a WAL database opened against an
+    # empty -wal is the ordinary case. Deleting them here would buy a tidier
+    # tar and one more thing to get wrong.
     check=$(sqlite3 "$dst" 'PRAGMA integrity_check;' 2>&1) || check="unreadable: $check"
     [ "$check" = "ok" ] || die "the snapshot of $src failed integrity_check: $check"
     chmod 600 "$dst"
