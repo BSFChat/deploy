@@ -16,6 +16,11 @@ config/identity.toml
 config/turnserver.conf
 nginx/bsfchat.conf
 
+# Backup archives written by ./backup.sh. These are the single most sensitive
+# artefact this deployment produces: a complete plaintext copy of every message,
+# the OIDC signing key and the TURN secret. They belong nowhere near git.
+backups/
+
 # Editor scratch
 *.swp
 *~

@@ -20,6 +20,14 @@ max_workers = 512
 # Absolute, and inside the /data volume mounted by docker-compose.yml.
 # A relative path here would put the database in the container's writable
 # layer, where it is destroyed on the next `docker compose up`.
+#
+# This file is NOT encrypted. It holds every message body in plaintext, a
+# second copy of each body in the search index, queued push payloads and the
+# audit log. Protect it with file permissions and by controlling who can read
+# the host: the server chmods it (and its -wal/-shm siblings) to owner-only on
+# every start, ./setup.sh chmods the containing directory to 0750, and
+# ./backup.sh writes 0600 archives. Anyone who can read data/server/ can read
+# every conversation on this server.
 path = "/data/bsfchat.db"
 
 [media]
@@ -31,7 +39,50 @@ max_upload_size_mb = ${MAX_UPLOAD_MB}
 
 [auth]
 registration_enabled = ${REGISTRATION_ENABLED}
-password_hash_cost = 12
+
+# PBKDF2-HMAC-SHA256 work factor as a POWER OF TWO: iterations = 2^cost.
+# 19 => 524,288 iterations, in line with current OWASP guidance and matching
+# the identity service's password_hash_iterations = 600000 in the same compose
+# file.
+#
+# This template used to ship 12, which is 4,096 iterations — 128x weaker, and
+# low enough that anyone who gets a copy of data/server/bsfchat.db cracks every
+# password in a wordlist at GPU speed. If your deployment predates this change,
+# raising it is safe and is the whole fix: each stored hash records the cost it
+# was created with, so old hashes keep verifying, and the server re-derives at
+# the new cost the next time each user logs in successfully. Nobody is locked
+# out and nothing needs a reset.
+#
+# The cost of raising it is CPU per login, on the login path only: roughly
+# 150-300ms per attempt on a small VPS instead of ~2ms. That is a feature (it
+# is the same 128x tax on an attacker's offline guessing) but it does mean a
+# server whose whole user base signs in at once after a restart does more work
+# than it used to. Values below 12 are clamped up at startup; anything below 19
+# logs a warning on every start.
+password_hash_cost = 19
+
+# Whose X-Forwarded-For the server believes when rate-limiting /login and
+# /register.
+#
+# nginx runs on the HOST and reaches this container through the published
+# 127.0.0.1:8448 port, so the peer address the server actually sees is the
+# Docker bridge gateway (172.x.0.1) — not loopback. The server ignores
+# X-Forwarded-For from any peer not listed here, which is correct (otherwise
+# any client could spoof its own address and defeat the limiter) but means
+# that without the 172.16/12 entry EVERY request looks like it came from one
+# address: all users share a single rate-limit bucket, and one person
+# retrying a bad password locks the whole server out of signing in.
+#
+# Safe because the container port is published on 127.0.0.1 only — nothing
+# off this machine can reach the server from that range, so nothing off this
+# machine can present a forged X-Forwarded-For that is believed.
+#
+# If you put something other than the bundled nginx in front — a proxy on
+# another host, or a container on a user-defined network — replace the
+# 172.16/12 entry with that proxy's actual address. Do not add 0.0.0.0/0.
+# Unparseable entries fail startup rather than being silently dropped.
+# (Ignored by server versions that predate auth rate limiting.)
+trusted_proxies = ["127.0.0.0/8", "::1", "172.16.0.0/12"]
 
 # ---------------------------------------------------------------------------
 # Media storage

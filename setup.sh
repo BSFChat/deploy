@@ -12,7 +12,27 @@
 
 set -eu
 
+# Everything this script creates is either a secret or config for a secret:
+# .env, the rendered server.toml and turnserver.conf all carry the TURN shared
+# secret, and the data directories hold the message database. Default to
+# owner-only and widen deliberately below, rather than creating files at
+# whatever umask the operator's shell happens to have and hoping.
+#
+# This also closes a narrower hole: the .env.tmp written during TURN_SECRET
+# generation was created at the ambient umask and only chmod'ed after the
+# rename, so the freshly generated secret was briefly world-readable.
+umask 077
+
 cd "$(dirname "$0")"
+
+# uids the container images run as. The rendered configs are bind-mounted into
+# containers that are NOT root, so a root-owned 0640 file is a file the
+# container cannot read — which presents as the service exiting at startup with
+# a message that reads like an application bug. Keep these in sync with
+# server/Dockerfile (USER 10001:10001) and with the coturn image, which runs as
+# nobody:nogroup.
+SERVER_UID=10001
+COTURN_UID=${COTURN_UID:-65534}
 
 CHECK_ONLY=0
 [ "${1:-}" = "--check" ] && CHECK_ONLY=1
@@ -117,6 +137,35 @@ if [ "$CHECK_ONLY" = 1 ]; then
             die "$f still contains placeholder values. Run ./setup.sh."
         fi
     done
+
+    # The TURN secret is no longer on coturn's command line, so docker-compose
+    # is no longer the thing that notices it is missing. Check it here instead:
+    # an empty static-auth-secret starts a relay that rejects every credential
+    # the chat server issues, and relayed calls then fail with nothing in any
+    # log that points at the cause.
+    grep -q '^static-auth-secret=.\+' config/turnserver.conf ||
+        die "config/turnserver.conf has no static-auth-secret. Re-run ./setup.sh."
+    if ! grep -qF "static-auth-secret=$TURN_SECRET" config/turnserver.conf; then
+        die "config/turnserver.conf's static-auth-secret does not match TURN_SECRET in .env.
+         coturn would reject every credential the chat server issues and all
+         relayed calls would fail. Run ./setup.sh."
+    fi
+
+    # Anything world-readable here is a secret handed to every local user:
+    # .env, server.toml and turnserver.conf all carry the TURN shared secret.
+    # Only the "other" triplet is checked — group read is deliberate on the two
+    # files a non-root container has to read.
+    for f in .env config/server.toml config/turnserver.conf; do
+        mode=$(ls -l "$f" | cut -c1-10)
+        case "$mode" in
+            *---) ;;
+            *) note "WARNING: $f is $mode — every local user can read the TURN"
+               note "         shared secret. Anyone holding it can mint valid TURN"
+               note "         credentials and relay traffic through this machine."
+               note "         Fix with: chmod o= $f  (or re-run ./setup.sh)" ;;
+        esac
+    done
+
     note "OK: .env is complete and all config files are rendered."
     exit 0
 fi
@@ -150,8 +199,49 @@ render config/identity.toml.template   config/identity.toml
 render config/turnserver.conf.template config/turnserver.conf
 render nginx/bsfchat.conf.template     nginx/bsfchat.conf
 
-# server.toml carries the TURN secret.
-chmod 640 config/server.toml
+# ---------------------------------------------------------------------------
+# Modes and ownership on the rendered config
+# ---------------------------------------------------------------------------
+# config/server.toml and config/turnserver.conf both carry the TURN shared
+# secret in cleartext. Anyone holding it can mint unlimited valid TURN
+# credentials and relay their own traffic through this machine's IP address.
+#
+# 0640 rather than 0600 because these are bind-mounted into containers that do
+# not run as root, so the container's uid needs to be able to read them. Own
+# them by that uid and keep the group read bit; "other" gets nothing.
+#
+# Non-fatal, matching the data-directory chown below: on rootless docker or a
+# userns-remap host the mapping is different and chown correctly refuses.
+harden_config() {
+    file="$1"; owner="$2"
+    if chown "$owner" "$file" 2>/dev/null; then
+        chmod 640 "$file"
+    else
+        # Fail CLOSED. The alternative — widening to 0644 so the container can
+        # read it whatever uid it runs as — hands the TURN secret to every
+        # local user to avoid a startup error, which is the wrong way round: a
+        # container that will not start is loud and fixable, a quietly
+        # world-readable secret is neither.
+        #
+        # This branch is normal under rootless docker, where the container's
+        # root maps to the invoking user and 0600 is already correct. On a
+        # rootful host it means setup.sh was not run as root.
+        chmod 600 "$file"
+        note "NOTE: could not chown $file to uid $owner; left it 0600 (owner only)."
+        note "      Correct for rootless docker. On a rootful host, if the"
+        note "      container exits saying it cannot read its config, run:"
+        note "        sudo chown $owner $file && sudo chmod 640 $file"
+    fi
+}
+
+harden_config config/server.toml     "$SERVER_UID"
+harden_config config/turnserver.conf "$COTURN_UID"
+
+# These two carry no secret — identity.toml names the deployment's hosts and a
+# key *path*, the nginx config names routes — so they stay 0644 and skip the
+# chown dance above. umask 077 would otherwise have made them 0600, which the
+# identity container (uid 10001) and nginx cannot read.
+chmod 644 config/identity.toml nginx/bsfchat.conf
 
 for f in config/server.toml config/identity.toml config/turnserver.conf nginx/bsfchat.conf; do
     if grep -q '\${' "$f"; then
@@ -170,14 +260,41 @@ mkdir -p data/server data/identity
 #
 # Non-fatal: on a rootless-docker or userns-remap host the mapping is
 # different and chown will (correctly) refuse.
-if chown -R 10001:10001 data/server data/identity 2>/dev/null; then
-    note "data/server and data/identity are owned by uid 10001 (the container user)."
+if chown -R "$SERVER_UID:$SERVER_UID" data/server data/identity 2>/dev/null; then
+    note "data/server and data/identity are owned by uid $SERVER_UID (the container user)."
 else
-    note "WARNING: could not chown data/server and data/identity to 10001:10001."
-    note "         The containers run as uid 10001 and need to write there."
-    note "         Run:  sudo chown -R 10001:10001 data/server data/identity"
+    note "WARNING: could not chown data/server and data/identity to $SERVER_UID:$SERVER_UID."
+    note "         The containers run as uid $SERVER_UID and need to write there."
+    note "         Run:  sudo chown -R $SERVER_UID:$SERVER_UID data/server data/identity"
     note "         (Ignore this if you run rootless docker or userns-remap.)"
 fi
+
+# These directories hold, in cleartext: every message ever sent, a second copy
+# of every message body in the search index, queued push payloads, the audit
+# log, uploaded media, and the identity service's OIDC RSA signing key. None of
+# it is encrypted at rest.
+#
+# Nothing used to set a mode on any of it. mkdir left the directories at the
+# ambient umask (0755) and the server created bsfchat.db at 0644, so on a host
+# where the deployment does not happen to sit under a 0700 /root, every local
+# user could read every conversation on the server. Close that here rather than
+# relying on where the operator chose to untar this directory.
+#
+# 0750, not 0700: the directories are owned by the container uid, so root can
+# still get in for backups but nothing else can.
+chmod 750 data data/server data/identity 2>/dev/null || true
+# The OIDC key directory gets nothing at all for group or other.
+[ -d data/identity/keys ] && chmod 700 data/identity/keys 2>/dev/null || true
+
+# Current server images chmod their own database (and its -wal/-shm siblings)
+# to owner-only at every start. Do it here too, for the case that matters most:
+# an existing deployment that ran an older image for months and whose files are
+# already 0644 on disk. find, not a glob, because -wal and -shm come and go.
+find data/server -name 'bsfchat.db*' -type f -exec chmod 600 {} + 2>/dev/null || true
+find data/identity -name '*.db*' -type f -exec chmod 600 {} + 2>/dev/null || true
+# The OIDC signing key. Losing it logs everyone out; leaking it lets the holder
+# mint tokens for any account on this server.
+find data/identity -name '*.pem' -type f -exec chmod 600 {} + 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Release channel
