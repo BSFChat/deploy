@@ -3,6 +3,15 @@
 # GENERATED FILE — do not edit. Edit ../.env and re-run ./setup.sh.
 # The template lives at nginx/bsfchat.conf.template.
 #
+# NOT VERIFIED BY `nginx -t` ANYWHERE IN THIS REPO. There is no nginx binary
+# or image on the machines this is developed on, and all setup.sh checks is
+# that no template placeholder survived rendering. The equivalent config was
+# confirmed valid by hand on the production host, and the access-log regexes
+# below were checked against PCRE with perl — but nginx itself has never
+# parsed this exact file. Run `sudo nginx -t` after installing it and read
+# what it says: a reload with a broken config leaves the old one serving and
+# puts the complaint in the journal, which looks like nothing happened.
+#
 # ===========================================================================
 #  READ THIS BEFORE GOING LIVE — origin TLS
 # ===========================================================================
@@ -47,10 +56,13 @@
 #
 #  Three things to know:
 #
-#   1. Add `mt=` here when signed media tickets land. The token-out-of-URL work
-#      replaces ?access_token= with a short-lived ticket in a second query
-#      parameter, which is a smaller exposure but still a credential and still
-#      does not belong in a log line.
+#   1. The map already lists `mt=` alongside `access_token=`. The
+#      token-out-of-URL work replaces ?access_token= with a short-lived
+#      ticket in a second query parameter — a smaller exposure, but still a
+#      credential and still not something that belongs in a log line, so it
+#      is redacted from the day that release lands rather than from the day
+#      somebody remembers to edit this file. See "The redaction itself"
+#      below for how to add the next one.
 #
 #   2. THE FIX IS FORWARD-ONLY. Every access log already written, and every
 #      rotated archive of one, contains live bearer tokens — and because token
@@ -105,9 +117,10 @@
 #
 #  THE REAL FIX IS THE TOKEN LEAVING THE URL. Signed media tickets replace
 #  ?access_token= with a short-lived, single-purpose ticket; that is scheduled
-#  for the release after this one. When it lands, add `mt=` to the map above
-#  AND revisit this block — a ticket in an error-log line is a much smaller
-#  problem than a session token, but it is still a credential on disk.
+#  for the release after this one. The access-log map above already covers
+#  `mt=`, but revisit THIS block when it lands — a ticket in an error-log
+#  line is a much smaller problem than a session token, but it is still a
+#  credential on disk, and nothing here redacts it.
 #
 #  Until then, the one lever available is suppression, and it costs you the
 #  diagnostics for exactly the failures you would want to debug. It is NOT
@@ -136,9 +149,57 @@
 #      sudo rm -f /var/log/nginx/error.log.*.gz /var/log/nginx/error.log.?
 # ===========================================================================
 
-map $request_uri $loggable_uri {
-    ~^(?<clean>[^?]*)\?(.*&)?access_token=[^&]*(&(?<rest>.*))?$  "$clean?<redacted>";
-    default                                                      $request_uri;
+# ---------------------------------------------------------------------------
+#  The redaction itself — two passes, and why
+# ---------------------------------------------------------------------------
+#  Pass 1 replaces the value of the first credential parameter with
+#  <redacted> and keeps everything around it. That is a change: the version
+#  this replaces captured the trailing parameters and then never used the
+#  capture, so a thumbnail request logged as a bare `?<redacted>` with no
+#  width, height or method. Safe, but it threw away the only signal you have
+#  when media starts 404ing or coming back the wrong size.
+#
+#  One regex can redact only one occurrence, so pass 2 is the backstop: if
+#  anything credential-shaped is still there after pass 1 — two access_token
+#  parameters, or a token and a ticket in the same URI — it throws the whole
+#  query string away. Over-redacting a strange URI beats logging a token, and
+#  a URI carrying two credentials is strange.
+#
+#  TO ADD A PARAMETER, add it to the (?:access_token|mt) alternation in BOTH
+#  maps. They have to stay identical: pass 2 is what makes pass 1 safe to
+#  splice. `mt` — the signed media ticket arriving next release — is listed
+#  already. It costs nothing until the server starts sending it, and listing
+#  it now means no deployment ends up redacting tokens but not tickets
+#  because the conf was not re-copied on upgrade.
+#
+#  A parameter only matches where its name starts immediately after `?` or
+#  `&` and is followed by `=`, so `my_access_token=`, `access_tokens=` and
+#  `xmt=` are left alone, and an encoded `%26access_token%3D` inside some
+#  other parameter's value stays one opaque value rather than becoming a
+#  separator plus a credential.
+#
+#  There is no nginx on the build machines, but PCRE is PCRE — check a change
+#  to the alternation with perl before you ship it:
+#
+#    perl -e '$u=shift;
+#      $u =~ s/^([^?]*)\?((?:[^&]*&)*?)(?:access_token|mt)=[^&]*/$1?$2<redacted>/;
+#      $u = "$1?<redacted>" if $u =~ m{^([^?]*)\?(?:[^&]*&)*(?:access_token|mt)=};
+#      print "$u\n"' '/m?width=96&access_token=SECRET&height=96'
+#    # want: /m?width=96&<redacted>&height=96
+# ---------------------------------------------------------------------------
+
+map $request_uri $loggable_uri_once {
+    ~^(?<lu_path>[^?]*)\?(?<lu_pre>(?:[^&]*&)*?)(?:access_token|mt)=[^&]*(?<lu_post>(?:&.*)?)$
+        "$lu_path?$lu_pre<redacted>$lu_post";
+    default
+        $request_uri;
+}
+
+map $loggable_uri_once $loggable_uri {
+    ~^(?<lu_path2>[^?]*)\?(?:[^&]*&)*(?:access_token|mt)=
+        "$lu_path2?<redacted>";
+    default
+        $loggable_uri_once;
 }
 
 log_format bsfchat '$remote_addr - $remote_user [$time_local] '

@@ -69,6 +69,19 @@ sudo ln -s /etc/nginx/sites-available/bsfchat /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
+**`nginx -t` in that third line is load-bearing, and this template has never
+been through it.** There is no nginx binary or image on the machine this repo
+is developed on, so nothing here parses the rendered file — `./setup.sh`
+checks only that every `${...}` was substituted. The equivalent config was
+confirmed valid by hand on the production host, so the directives are
+known-good in substance; what is untested is this file. The two access-log
+`map` regexes were verified separately against PCRE with `perl`, which is the
+same engine nginx uses but tells you nothing about whether nginx accepts the
+surrounding directives. Treat `nginx -t` as the first real test of this
+config, and read its output: `systemctl reload nginx` with a broken config
+leaves the old one serving and puts the error in the journal, which from the
+outside looks exactly like a reload that did nothing.
+
 **Read the header comment in that file before you go live.** As generated it
 listens on port 80 only, which is fine while you obtain a certificate and not
 fine afterwards. If you terminate TLS at Cloudflare with SSL/TLS mode
@@ -381,6 +394,16 @@ header. With the default format, `/var/log/nginx/access.log` is a file of
 working bearer tokens, readable by anyone in the `adm` group and copied into
 every rotated archive. The `map` in the template rewrites the URI **for logging
 only**; what nginx proxies upstream is untouched.
+
+It redacts the credential and keeps the rest of the query string, so a
+thumbnail request logs as
+`/_matrix/media/v3/thumbnail/h/id?width=96&height=96&method=crop&<redacted>`
+— the parameters you need to diagnose a media problem survive, the token does
+not. It is two `map` blocks rather than one because a single regex can redact
+only one occurrence; the second pass drops the whole query string if anything
+credential-shaped is still present after the first. `mt=`, the signed media
+ticket arriving next release, is already covered. The header comment in the
+template says how to add the next parameter and how to check it with `perl`.
 
 Two things this does not do:
 
