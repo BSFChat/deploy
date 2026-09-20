@@ -38,6 +38,43 @@ CHECK_ONLY=0
 [ "${1:-}" = "--check" ] && CHECK_ONLY=1
 
 die() { printf '\n  ERROR: %s\n\n' "$1" >&2; exit 1; }
+
+# Warn when the nginx config installed on this box is not the one this repo
+# renders.
+#
+# This exists because of a real outage. Production ran for months with
+# `proxy_read_timeout 60s` hand-edited into /etc/nginx/sites-enabled/bsfchat,
+# while nginx/bsfchat.conf.template here said 330s the whole time. Nothing
+# noticed: nginx does not care where its config came from, and the rendered
+# file sitting in this directory is not the file nginx reads. A bot parking a
+# /sync long poll at the protocol maximum was cut off every 60 seconds and
+# went silent for fifteen minutes while reporting itself healthy. See
+# "Long polls, proxy timeouts, and the ceiling you cannot raise" in README.md.
+#
+# A warning, never a failure: a deployment may legitimately have local edits
+# (a second server_name, an extra location), and refusing to run over a diff
+# would just teach people to skip this script. The point is that the drift is
+# SAID OUT LOUD once per run instead of discovered during an incident.
+check_installed_nginx() {
+    installed=""
+    for candidate in /etc/nginx/sites-enabled/bsfchat \
+                     /etc/nginx/sites-available/bsfchat \
+                     /etc/nginx/conf.d/bsfchat.conf; do
+        [ -e "$candidate" ] && { installed=$candidate; break; }
+    done
+    [ -n "$installed" ] || return 0
+    [ -r "$installed" ] || return 0          # not root; say nothing rather than guess
+    cmp -s "$installed" nginx/bsfchat.conf && return 0
+
+    note "WARNING: $installed differs from nginx/bsfchat.conf."
+    note "         The installed file is what nginx actually serves; this one is"
+    note "         only what the templates render. See it with:"
+    note "             diff -u $installed nginx/bsfchat.conf"
+    note "         If the box is right, fix nginx/bsfchat.conf.template so the"
+    note "         next run does not reinstate the difference. If this file is"
+    note "         right, install it and reload:"
+    note "             cp nginx/bsfchat.conf $installed && nginx -t && systemctl reload nginx"
+}
 note() { printf '  %s\n' "$1"; }
 
 # ---------------------------------------------------------------------------
@@ -174,6 +211,8 @@ if [ "$CHECK_ONLY" = 1 ]; then
         esac
     done
 
+    check_installed_nginx
+
     note "OK: .env is complete and all config files are rendered."
     exit 0
 fi
@@ -206,6 +245,9 @@ render config/server.toml.template     config/server.toml
 render config/identity.toml.template   config/identity.toml
 render config/turnserver.conf.template config/turnserver.conf
 render nginx/bsfchat.conf.template     nginx/bsfchat.conf
+
+# Rendering the file is not installing it. Say so if the two have parted.
+check_installed_nginx
 
 # ---------------------------------------------------------------------------
 # Modes and ownership on the rendered config
@@ -340,6 +382,15 @@ cat <<EOF
        at this machine (${TURN_EXTERNAL_IP}).
     3. Reverse proxy — install nginx/bsfchat.conf, then read the TLS note at
        the top of it. Do not leave the origin on plaintext HTTP.
+       Install it; do not hand-edit the copy under /etc/nginx. A 60s
+       proxy_read_timeout edited in on the box, and never reflected here,
+       is what silently blinded an integration bot on /sync. Verify with:
+           sudo nginx -t && sudo systemctl reload nginx
+           sudo nginx -T | grep -E 'proxy_(read|send)_timeout'
+       If you put Cloudflare in front, read "Long polls, proxy timeouts,
+       and the ceiling you cannot raise" in README.md first: its ~100s
+       origin-pull limit caps /sync below the protocol's 300s maximum and
+       no nginx setting raises it.
     4. docker compose up -d
 
 EOF
