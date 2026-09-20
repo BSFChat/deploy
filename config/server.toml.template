@@ -85,6 +85,41 @@ password_hash_cost = 19
 # rather than being silently dropped.
 trusted_proxies = ["127.0.0.0/8", "::1", "172.16.0.0/12"]
 
+# Public ranges you are deliberately trusting, and why.
+#
+# Behind a CDN this matters. Cloudflare terminates TLS at an edge node and
+# nginx then appends that node's PUBLIC address to X-Forwarded-For, so the
+# rightmost hop the server sees is Cloudflare, not your user. Leave the edge
+# ranges untrusted and every user shares one bucket — the same outage the
+# 172.16/12 entry above exists to prevent, one hop further out.
+#
+# Put them here rather than in trusted_proxies. This is the list, not a copy of
+# it: entries are trusted identically, and there is nothing to keep in step.
+# What the separate key buys you is that the server stops warning about THESE
+# ranges specifically, and goes on warning about any public range you have not
+# written here — including one added after this file was last reviewed.
+#
+# The reason is required for that to take effect. Nothing in the server fetches
+# the list; refresh it yourself from https://www.cloudflare.com/ips-v4 and
+# https://www.cloudflare.com/ips-v6 and move the date along when you do. If
+# Cloudflare adds a range you have not got, users arriving through it share one
+# bucket (the server's runtime "X-Forwarded-For from an untrusted peer" warning
+# is the symptom). If Cloudflare gives one up, you carry on trusting it after
+# it is reassigned — which is what the date is for.
+#
+# A range too wide to be an edge fleet — 0.0.0.0/0, ::/0, a public /8 — still
+# warns from here. This key acknowledges a CDN; it is not an off switch.
+#
+# BETTER, IF YOU CAN: have nginx resolve the real client instead, so this
+# server never trusts a public range at all. See the commented realip block in
+# nginx/bsfchat.conf.template — it keeps the CDN list in ONE place (nginx) and
+# leaves trusted_proxies at loopback + the bridge.
+#
+#   trusted_public_proxies = [ ...cloudflare.com/ips-v4 and ips-v6... ]
+#   trusted_public_proxies_reason = "Cloudflare edge, refreshed 2026-09-20"
+trusted_public_proxies = []
+trusted_public_proxies_reason = ""
+
 # ---------------------------------------------------------------------------
 # Media storage
 # ---------------------------------------------------------------------------
