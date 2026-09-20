@@ -38,6 +38,100 @@
 # ===========================================================================
 
 # ===========================================================================
+#  LONG-POLL TIMEOUTS — the smallest number in the path wins
+# ===========================================================================
+#  /sync is a LONG POLL. The client opens it and the server answers nothing,
+#  holding the socket, until either an event arrives (a condition variable
+#  wakes it within microseconds of the commit) or the timeout the client
+#  asked for expires. A client may ask for up to kMaxSyncTimeoutMs = 300s
+#  (protocol/include/bsfchat/Constants.h). The default, and what the desktop
+#  client asks for, is kDefaultSyncTimeoutMs = 30s.
+#
+#  Every proxy in front of the server has its own opinion about how long a
+#  response may take, and the SMALLEST one in the chain decides. A poll cut
+#  short by a proxy does not reach the client as a timeout. It reaches the
+#  client as an HTML error page where a sync response was expected.
+#
+#  THE SYMPTOM, stated plainly because it is what you will search for: a
+#  client or bot connects successfully, authenticates, reports its rooms
+#  correctly — and then receives no events at all, indefinitely. Messages
+#  sent from another client never arrive. Nothing in the server log looks
+#  wrong, because nothing at the server IS wrong: it is still holding the
+#  poll when the proxy gives up on it. What you find, in the PROXY's log,
+#  is periodic 504s (nginx) or 524s (Cloudflare) on
+#  /_matrix/client/v3/sync at a suspiciously regular interval, each one
+#  carrying an HTML body the client has no way to interpret.
+#
+#  This is not hypothetical. The production nginx ran with
+#  proxy_read_timeout 60s — hand-edited on the box, never present in this
+#  repo — and an integration bot asking for the maximum the protocol
+#  permits was blinded for fifteen minutes while looking, from its own
+#  logs, perfectly healthy. The desktop client escaped only because its 30s
+#  default is under 60s. That is the whole reason the numbers below carry
+#  their reasoning instead of being bare numbers: a bare number is how the
+#  60s got there.
+#
+#  The chain, smallest wins:
+#
+#    client's requested ?timeout=     up to 300s   client's choice
+#    server's own cap                     300s     kMaxSyncTimeoutMs
+#    nginx proxy_read_timeout             330s     set below
+#    Cloudflare origin-pull ceiling      ~100s     NOT settable here
+#
+#  ── If Cloudflare (or any CDN) is in front of this ──────────────────────
+#  Cloudflare abandons an origin pull after roughly 100 seconds on every
+#  plan below Enterprise and returns its own 524 page. NOTHING IN THIS FILE
+#  CHANGES THAT. proxy_read_timeout governs nginx's patience with the chat
+#  server; it has no bearing whatsoever on Cloudflare's patience with
+#  nginx. So on a Cloudflare-proxied deployment the true ceiling on a /sync
+#  poll is under 100s, not the 300s the protocol advertises — and a client
+#  that asks for 300s because the protocol says it may is broken before it
+#  starts. Keep clients at or below 60s there. See "Reverse Proxy" in
+#  ../README.md for how to measure your own ceiling and how to tell a 504
+#  from a 524.
+#
+#  ── What these timeouts are NOT ─────────────────────────────────────────
+#  proxy_read_timeout is not a slow-loris exposure, and raising it does not
+#  open one. It bounds how long nginx waits on the UPSTREAM — the chat
+#  server, on loopback — not how long a client may dawdle. Client-side
+#  patience is client_header_timeout, client_body_timeout and send_timeout,
+#  all 60s by default, none of them set in this file, and none of which
+#  should be raised for /sync. What a long poll costs nginx is one
+#  connection slot for the length of the poll, which is exactly what a long
+#  poll is for.
+#
+#  keepalive_timeout (75s by default) is not involved either: it bounds an
+#  IDLE connection between requests, not a request in flight. Raising it
+#  does nothing for a long poll, and people do raise it while chasing this.
+#
+#  ── worker_connections, which is not in this file ───────────────────────
+#  The one nginx default that IS hostile to a long-poll workload lives in
+#  nginx.conf, not here: `worker_connections` (768 on Debian/Ubuntu). Every
+#  parked poll holds one client connection AND one upstream connection, so
+#  the ceiling is roughly worker_connections/2 per worker process before
+#  nginx starts refusing accepts and logging "worker_connections are not
+#  enough". A short-request workload never comes near it; this one parks
+#  connections by design. Raise it in nginx.conf's `events { }` block if you
+#  are running more than a few hundred clients per worker process:
+#      events { worker_connections 4096; }
+#  and check `ulimit -n` for the nginx user at the same time, since a
+#  worker_connections above the fd limit just fails differently.
+#
+#  ── No websockets pass through this file ────────────────────────────────
+#  There is deliberately no `proxy_set_header Upgrade` / `Connection
+#  "upgrade"` here: the chat API uses long polling rather than websockets,
+#  and voice uses coturn (not HTTP, not proxied) plus an optional external
+#  LiveKit SFU on its own host. If you ever front a LiveKit SFU with THIS
+#  nginx, it needs its own server block with the Upgrade/Connection headers
+#  and a long proxy_read_timeout — a websocket without those headers
+#  degrades to a plain HTTP request that fails in a way that looks like
+#  anything but a proxy problem. Do not add those headers to the blocks
+#  below: proxy_set_header is all-or-nothing per location (see the note at
+#  the chat server block), so adding them there silently drops
+#  X-Forwarded-For and puts every user in one rate-limit bucket.
+# ===========================================================================
+
+# ===========================================================================
 #  ACCESS LOGGING — do not remove the `bsfchat` format below
 # ===========================================================================
 #  nginx's built-in `combined` format logs $request, which is the raw request
@@ -107,8 +201,11 @@
 #      oversized upload is refused by the SERVER with a JSON error rather than
 #      by nginx with a 413. The 413 path is reached only by a body larger than
 #      the server's own limit plus 8MB.
-#    * proxy_read_timeout is 330s, above the server's 300s long-poll cap, so a
-#      /sync long poll completing normally does not become a 504.
+#    * /sync has proxy_read_timeout 330s, above the server's 300s long-poll
+#      cap, so a long poll completing normally does not become a 504. That is
+#      the endpoint this mattered for; everything else runs at 120s, where a
+#      504 means the upstream really is stuck and the error-log line is the
+#      diagnostic you want.
 #
 #  What is left is genuinely occasional: a restart or crash of the chat server
 #  while media requests are in flight, which logs one line per in-flight
@@ -129,9 +226,11 @@
 #  have decided tokens-on-disk is the bigger risk for your deployment.
 #
 #  To suppress, uncomment the error_log line in the chat server's `location /`
-#  below. `crit` keeps crit/alert/emerg and drops everything at `error`,
-#  including the two cases above. It applies to the whole proxied chat API, so
-#  you also lose upstream diagnostics for /sync, /login and everything else.
+#  below — AND the one in the `location = /_matrix/client/v3/sync` block, which
+#  is a separate location and keeps its own error_log. `crit` keeps
+#  crit/alert/emerg and drops everything at `error`, including the two cases
+#  above. It applies to the whole proxied chat API, so you also lose upstream
+#  diagnostics for /sync, /login and everything else.
 #  If that is too blunt, split the media paths into their own location — a copy
 #  of `location /` at `/_matrix/media/` with the raised error_log — and accept
 #  that the two blocks now have to be kept in step by hand.
@@ -286,36 +385,102 @@ server {
         root /var/www/html;
     }
 
-    # Uncomment once the TLS block below is live:
-    # location / { return 301 https://$host$request_uri; }
+    # Once the TLS block below is live, this server block should redirect and
+    # proxy nothing. DELETE everything from `client_max_body_size` to the end
+    # of this block and put this in its place — do not simply add it:
+    #
+    #     location / { return 301 https://$host$request_uri; }
+    #
+    # Two ways to get this wrong. Adding it while `location /` is still here
+    # is a duplicate location, and nginx refuses to load the file at all —
+    # `nginx -t` says so. The quieter one is adding the redirect and leaving
+    # the /sync block behind: `location = /_matrix/client/v3/sync` is an exact
+    # match and outranks the prefix `location /`, so every long poll would go
+    # on being served over plaintext HTTP while everything else redirected,
+    # and it would look like it was working.
+    #
+    # The ACME location above stays either way, or renewal breaks.
 
     client_max_body_size ${NGINX_MAX_BODY_MB}M;
+
+    # ── Proxy settings shared by both locations below ───────────────────────
+    # These live at SERVER level, not inside `location /`, because nginx
+    # inherits a directive from the ENCLOSING block — a `location = /...` does
+    # NOT inherit from `location /`. Server level is the only place that
+    # reaches both, and putting them here is what stops the long-poll location
+    # and the general one drifting apart the next time a header is added.
+    #
+    # One trap worth knowing: proxy_set_header is all-or-nothing. A location
+    # that sets a single header of its own silently loses all four inherited
+    # ones, and the chat server then sees no X-Forwarded-For at all. If you
+    # need a header on one location, repeat the whole set there.
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # Long polls and media streaming should not sit in an nginx buffer.
+    proxy_buffering off;
+    proxy_request_buffering off;
+
+    # The default for every proxied request EXCEPT the long poll, which
+    # overrides it below. Read "LONG-POLL TIMEOUTS" at the top of this file
+    # for the incident these numbers come from.
+    #
+    # Why this is scoped instead of 330s everywhere: 330s is the right answer
+    # for the one endpoint that is DESIGNED to hang, and the wrong answer for
+    # every other endpoint, where a hang means the chat server is wedged. With
+    # 330s on everything, a wedged upstream holds each arriving connection for
+    # five and a half minutes before anyone is told anything; at 120s the same
+    # failure surfaces as a 504 in two. 120s is still far above any honest
+    # request here — the slowest is a MAX_UPLOAD_MB media transfer over
+    # loopback — so in normal operation this never fires.
+    #
+    # Note this is NOT the slow-loris lever; see the header block. Client-side
+    # patience is client_header_timeout / client_body_timeout / send_timeout,
+    # left at their 60s defaults.
+    proxy_read_timeout 120s;
+    proxy_send_timeout 120s;
+
+    # ── The long poll ───────────────────────────────────────────────────────
+    # The only endpoint that needs the big timeout. Exact match: nothing else
+    # blocks server-side (the voice endpoints return immediately — the client
+    # polls them by repeating the request), and a query string does not affect
+    # location matching, so ?timeout=300000&since=... lands here.
+    #
+    # 330s = kMaxSyncTimeoutMs (300s) + 30s of margin. It MUST stay above
+    # 300s: at or below it, a poll that runs to the server's own cap is cut by
+    # nginx first and the client receives an HTML 504 instead of a sync
+    # response — the failure described at the top of this file. The margin
+    # covers writing a large response out over a slow link after the poll has
+    # already used its full budget.
+    #
+    # proxy_send_timeout is raised alongside it for symmetry rather than
+    # necessity: a /sync GET carries no request body, so nginx is never slow
+    # at sending one and this cannot fire. It is here so the pair does not
+    # look half-edited to whoever reads it next.
+    location = /_matrix/client/v3/sync {
+        # Keep this in step with the error_log line in `location /` below:
+        # since the split, uncommenting it there no longer covers /sync, and
+        # /sync is where upstream-timeout errors actually come from.
+        # error_log /var/log/nginx/error.log crit;
+
+        proxy_pass http://127.0.0.1:8448;
+        proxy_read_timeout 330s;
+        proxy_send_timeout 330s;
+    }
 
     location / {
         # Uncomment to keep session tokens out of the error log, at the cost of
         # every error-level diagnostic for the chat API (413s, upstream
         # failures and timeouts). Read "ERROR LOGGING" at the top of this file
         # first — this is a deliberate trade, not a free win, and the real fix
-        # arrives with signed media tickets.
+        # arrives with signed media tickets. Uncomment it in the /sync block
+        # above too, or that path keeps logging.
         # error_log /var/log/nginx/error.log crit;
 
         proxy_pass http://127.0.0.1:8448;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        # /sync long-polling. The server caps a long-poll at
-        # kMaxSyncTimeoutMs = 300s (protocol/include/bsfchat/Constants.h), so
-        # anything at or below 300s here cuts live connections mid-poll and
-        # clients see spurious disconnects. Must stay > 300s.
-        proxy_read_timeout 330s;
-        proxy_send_timeout 330s;
-
-        # Long-polls and media streaming should not sit in an nginx buffer.
-        proxy_buffering off;
-        proxy_request_buffering off;
     }
 }
 
@@ -331,9 +496,17 @@ server {
         root /var/www/html;
     }
 
-    # Uncomment once the TLS block below is live:
-    # location / { return 301 https://$host$request_uri; }
+    # Once the TLS block below is live, REPLACE the `location /` below with:
+    #     location / { return 301 https://$host$request_uri; }
+    # Replace, not add — two `location /` blocks is a config nginx refuses to
+    # load. The ACME location above stays, or renewal breaks.
 
+    # No proxy_read_timeout here on purpose. The identity service has no
+    # long-poll endpoint — every route is a short OIDC request — so nginx's
+    # 60s default is correct, and raising it would only delay the moment you
+    # find out the identity container is wedged. If you ever add a blocking
+    # endpoint here, it needs its own location block and the reasoning at the
+    # top of this file applies to it.
     location / {
         proxy_pass http://127.0.0.1:8480;
         proxy_http_version 1.1;
@@ -375,20 +548,37 @@ server {
 #
 #     client_max_body_size ${NGINX_MAX_BODY_MB}M;
 #
+#     # Same split as the port-80 block above, for the same reasons. Keep the
+#     # two in step: once the redirect is live this is the block that actually
+#     # serves traffic, and a 330s that exists only in the port-80 block is a
+#     # 120s long-poll ceiling in production with nothing to show for it.
+#     proxy_http_version 1.1;
+#     proxy_set_header Host $host;
+#     proxy_set_header X-Real-IP $remote_addr;
+#     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+#     proxy_set_header X-Forwarded-Proto $scheme;
+#     proxy_buffering off;
+#     proxy_request_buffering off;
+#     proxy_read_timeout 120s;
+#     proxy_send_timeout 120s;
+#
+#     # The long poll. 330s = kMaxSyncTimeoutMs (300s) + margin; must stay
+#     # above 300s. See "LONG-POLL TIMEOUTS" at the top of this file — and
+#     # note that behind Cloudflare the effective ceiling is ~100s regardless
+#     # of what this says.
+#     location = /_matrix/client/v3/sync {
+#         # error_log /var/log/nginx/error.log crit;
+#         proxy_pass http://127.0.0.1:8448;
+#         proxy_read_timeout 330s;
+#         proxy_send_timeout 330s;
+#     }
+#
 #     location / {
-#         # See "ERROR LOGGING" at the top of this file before enabling:
+#         # See "ERROR LOGGING" at the top of this file before enabling, and
+#         # uncomment it in the /sync block above too:
 #         # error_log /var/log/nginx/error.log crit;
 #
 #         proxy_pass http://127.0.0.1:8448;
-#         proxy_http_version 1.1;
-#         proxy_set_header Host $host;
-#         proxy_set_header X-Real-IP $remote_addr;
-#         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-#         proxy_set_header X-Forwarded-Proto $scheme;
-#         proxy_read_timeout 330s;   # > kMaxSyncTimeoutMs (300s)
-#         proxy_send_timeout 330s;
-#         proxy_buffering off;
-#         proxy_request_buffering off;
 #     }
 # }
 #

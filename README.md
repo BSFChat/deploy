@@ -96,12 +96,17 @@ sudo certbot --nginx -d chat.example.com -d id.example.com
 then uncomment the TLS blocks and the `return 301` redirects in the file, and
 set Cloudflare to **Full (strict)**.
 
-Two proxy settings are load-bearing and are generated from `.env` so they
-cannot drift:
+Two proxy settings are load-bearing:
 
-- `proxy_read_timeout 330s` — the server allows `/sync` long-polls up to
-  300s (`kMaxSyncTimeoutMs`). A shorter proxy timeout cuts them mid-poll and
-  clients see constant reconnects.
+- `proxy_read_timeout 330s`, on the `/sync` location — the server allows
+  `/sync` long-polls up to 300s (`kMaxSyncTimeoutMs`). A shorter proxy
+  timeout cuts them mid-poll. Read
+  "[Long polls, proxy timeouts, and the ceiling you cannot
+  raise](#long-polls-proxy-timeouts-and-the-ceiling-you-cannot-raise)" below
+  before you touch it — this is the setting that has already caused an
+  outage here, and if you are behind Cloudflare it is not the number that
+  decides your real ceiling. It is a literal in the template, **not**
+  rendered from `.env`.
 - `client_max_body_size` — derived from `MAX_UPLOAD_MB`, with a little
   headroom so an oversized upload is rejected by the server (proper JSON
   error) rather than by nginx (bare HTML 413).
@@ -153,19 +158,204 @@ it saw `206` there. The cap is a compile-time constant
 
 Zero-length uploads are refused with `400`.
 
-Caddy equivalent, if you prefer it:
+Caddy equivalent, if you prefer it. Same split as the nginx config: the
+long timeout is scoped to the long poll, and everything else keeps a value
+where a wedged upstream surfaces quickly.
 
 ```
 chat.example.com {
+    # The long poll. 330s = kMaxSyncTimeoutMs (300s) + margin; must stay
+    # above 300s or /sync is cut mid-poll. See "Long polls, proxy timeouts,
+    # and the ceiling you cannot raise" above — behind Cloudflare the real
+    # ceiling is ~100s no matter what this says.
+    @sync path /_matrix/client/v3/sync
+    reverse_proxy @sync localhost:8448 {
+        transport http { read_timeout 330s write_timeout 330s }
+    }
+
     reverse_proxy localhost:8448 {
-        transport http { read_timeout 330s }
+        transport http { read_timeout 120s write_timeout 120s }
     }
     request_body { max_size 108MB }
 }
 id.example.com {
+    # No long-poll endpoint here; Caddy's defaults are correct.
     reverse_proxy localhost:8480
 }
 ```
+
+Caddy is not tested here either — the same caveat as `nginx -t` applies, and
+`caddy validate` is the equivalent first real check.
+
+## Long polls, proxy timeouts, and the ceiling you cannot raise
+
+**If a client or bot connects fine and then receives nothing, read this
+first. It is almost always this.**
+
+### The symptom
+
+A client or bot signs in successfully, reports its rooms correctly, and then
+receives no events at all — indefinitely. Messages sent from another client
+never arrive. The server log looks clean, because nothing at the server is
+wrong. In the *proxy's* log you find periodic `504`s (nginx) or `524`s
+(Cloudflare) on `/_matrix/client/v3/sync`, at a suspiciously regular
+interval, each carrying an HTML body the client cannot parse and does not
+expect.
+
+This happened in production on 2026-09-20. The box was running
+`proxy_read_timeout 60s`, hand-edited into
+`/etc/nginx/sites-enabled/bsfchat` and never present in this repo. An
+integration bot asking for the maximum the protocol permits was blinded for
+fifteen minutes while looking, from its own logs, perfectly healthy. The
+desktop client was unaffected — not because it was doing anything better,
+but because its 30s default happened to be under 60s.
+
+### Why it happens
+
+`/sync` is a **long poll**. The client opens the request and the server
+answers nothing, holding the socket, until an event arrives (a condition
+variable wakes it within microseconds of the commit) or the timeout the
+client asked for expires. The protocol lets a client ask for up to 300s
+(`kMaxSyncTimeoutMs`); the default is 30s (`kDefaultSyncTimeoutMs`).
+
+Every hop in front of the server has its own idea of how long a response may
+take, and **the smallest number in the chain wins**:
+
+| Hop | Limit | Where it is set |
+| --- | --- | --- |
+| Client's requested `?timeout=` | up to 300s | the client's own config |
+| Chat server's cap | 300s | `kMaxSyncTimeoutMs`, compiled in |
+| nginx `proxy_read_timeout` | 330s | `nginx/bsfchat.conf`, `/sync` location |
+| **Cloudflare origin pull** | **~100s** | **not settable from nginx** |
+| any other CDN / load balancer / corporate proxy | varies | not here |
+
+A hop that gives up does not hand the client a timeout. It hands the client
+an HTML error page where a JSON sync response was expected, which is why
+this presents as silence rather than as an error.
+
+### The Cloudflare ceiling — for anyone self-hosting behind a CDN
+
+Cloudflare abandons an origin pull after roughly **100 seconds** on every
+plan below Enterprise and serves its own `524 A Timeout Occurred` page.
+**Nothing in `nginx/bsfchat.conf` changes this.** `proxy_read_timeout`
+governs nginx's patience with the chat server; it has no bearing on
+Cloudflare's patience with nginx. Raising it to 330s, or to an hour, moves
+nothing.
+
+So on a Cloudflare-proxied deployment the real ceiling on a `/sync` poll is
+under 100s, not the 300s the protocol advertises — and a client that asks
+for 300s *because the protocol says it may* is broken before it starts.
+The protocol maximum describes what the server will honour, not what your
+deployment can deliver.
+
+**What to do about it:**
+
+- **Keep clients at or below 60s.** The 30s default is fine and costs very
+  little: `/sync` is event-driven, so a client is woken the instant an event
+  is committed — the timeout only decides how often an *idle* connection is
+  re-established. A shorter poll is a few more empty round trips per hour,
+  not more latency on messages.
+- **Do not raise a client's sync timeout to "reduce reconnects" behind a
+  CDN.** Past ~90s you are buying 524s.
+- **If you genuinely need the full 300s** — a bot on a metered link, say —
+  the chat host has to bypass the CDN proxy. Set that DNS record to
+  DNS-only ("grey cloud") and terminate TLS at your own nginx, or move to a
+  plan where the ceiling is raisable. A `cloudflared` tunnel does **not**
+  buy you more here; it is subject to the same proxy timeouts.
+
+Other CDNs and load balancers have their own ceilings (AWS ALB's idle
+timeout defaults to 60s, for instance). The exercise is the same: find the
+smallest number in the chain.
+
+### Finding your own ceiling
+
+Measure it, do not assume it. With a valid access token and a current
+`since` token, ask for a long poll in a quiet room and time how long you
+wait and what comes back:
+
+```bash
+TOKEN=...   # a working access token
+SINCE=...   # the next_batch from a normal /sync
+
+# Through the CDN, as a client sees it:
+curl -s -o /dev/null -w 'http=%{http_code}  after=%{time_total}s\n' \
+  -H "Authorization: Bearer $TOKEN" \
+  "https://chat.example.com/_matrix/client/v3/sync?since=$SINCE&timeout=120000"
+
+# Straight at the origin, bypassing the CDN entirely:
+curl -s -o /dev/null -w 'http=%{http_code}  after=%{time_total}s\n' \
+  --resolve chat.example.com:443:ORIGIN_IP \
+  -H "Authorization: Bearer $TOKEN" \
+  "https://chat.example.com/_matrix/client/v3/sync?since=$SINCE&timeout=120000"
+```
+
+Reading the result:
+
+| What you see | What it means |
+| --- | --- |
+| `http=200 after=120s` | Healthy. The poll ran its full budget and returned an empty sync. |
+| `http=504` at ~60s, both requests | nginx is cutting it. Your installed config is not this repo's — see below. |
+| `http=524` at ~100s, CDN only; origin fine | The Cloudflare ceiling. Expected. Lower your clients' timeout. |
+| `http=502` immediately | The chat server is down or not listening on 8448. A different problem. |
+
+The 504-vs-524 distinction is the whole diagnosis: a 504 is *your* proxy
+giving up on the server, a 524 is *Cloudflare* giving up on your proxy.
+
+### Check what is actually installed
+
+The production incident was not a wrong value in this repo. This repo has
+had `330s` since configs were first rendered from `.env`. It was a
+**hand-edit on the box** that no one diffed against the source for months.
+Nothing in nginx warns you about this; a config that only exists on the
+server is a config no one reviews.
+
+After any change, and periodically:
+
+```bash
+# Is what is installed what this repo renders?
+./setup.sh                                                  # re-render
+sudo diff -u /etc/nginx/sites-enabled/bsfchat nginx/bsfchat.conf
+
+# What timeouts is the running nginx actually configured with?
+sudo nginx -T 2>/dev/null | grep -nE 'proxy_(read|send)_timeout|client_max_body_size'
+```
+
+`nginx -T` (capital T) dumps the *whole* effective configuration including
+every include, which is the only way to catch a value set in `nginx.conf`
+or a snippet rather than in this file. If `diff` reports anything, decide
+which side is right and then fix the *template*, not the box — otherwise
+the next `./setup.sh` reinstates the bug, or the next person re-fixes it.
+
+`./setup.sh` now warns when the installed file differs from what it just
+rendered.
+
+### The other nginx default that dislikes long polls
+
+`worker_connections` is set in `nginx.conf`, not in the file this repo
+renders, and Debian and Ubuntu ship it at **768**. A parked `/sync` poll
+holds *two* connection slots — one facing the client, one facing the chat
+server — so the practical ceiling is about `worker_connections / 2` per
+worker process. A normal web workload never approaches that. This one parks
+connections on purpose.
+
+Above a few hundred simultaneous clients per worker process, raise it:
+
+```nginx
+events {
+    worker_connections 4096;
+}
+```
+
+and raise the nginx user's file-descriptor limit to match
+(`LimitNOFILE` in the unit, or `worker_rlimit_nofile`) — a
+`worker_connections` above the fd limit does not give you more capacity, it
+just fails differently. The symptom to watch for in `error.log` is
+`768 worker_connections are not enough`.
+
+This is separate from, and additional to, `workers` in `config/server.toml`
+(see "Sizing the worker pool") — nginx's ceiling and the chat server's
+thread pool are two independent limits on the same long polls, and both have
+to be sized for the client count.
 
 ## Voice Chat
 
@@ -341,6 +531,12 @@ actual address. Never `0.0.0.0/0`: that lets any client pick its own rate-limit
 bucket and the limiter stops existing.
 
 ### Behind Cloudflare
+
+This section is about client IP addresses. Cloudflare also imposes a
+**~100 second ceiling on `/sync` long polls** that nothing in your nginx
+config can raise — if clients connect and then go silent, that is the other
+section: "[Long polls, proxy timeouts, and the ceiling you cannot
+raise](#long-polls-proxy-timeouts-and-the-ceiling-you-cannot-raise)".
 
 Cloudflare terminates TLS at an edge node, so `$remote_addr` at nginx is a
 Cloudflare address on every request and `$proxy_add_x_forwarded_for` appends
