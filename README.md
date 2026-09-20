@@ -340,6 +340,84 @@ or a container on a user-defined network — replace that entry with the proxy's
 actual address. Never `0.0.0.0/0`: that lets any client pick its own rate-limit
 bucket and the limiter stops existing.
 
+### Behind Cloudflare
+
+Cloudflare terminates TLS at an edge node, so `$remote_addr` at nginx is a
+Cloudflare address on every request and `$proxy_add_x_forwarded_for` appends
+it. The chat server reads the rightmost hop it is willing to believe, which
+means that unless it trusts the Cloudflare edge, **every user is one client**
+and the first person to fail a password enough times locks the whole server out
+of `/login`. It is the same failure as the Docker-bridge one above, one hop
+further out.
+
+Two ways to fix it. They are not equivalent.
+
+**Preferred: resolve the real client at nginx.** `nginx/bsfchat.conf.template`
+carries a commented `set_real_ip_from` / `real_ip_header CF-Connecting-IP`
+block. Uncomment it and nginx rewrites `$remote_addr` to the real client before
+it builds `X-Forwarded-For`, so the chat server only ever has to trust nginx —
+`trusted_proxies` stays at loopback plus the bridge and nothing public is
+trusted at all. The Cloudflare range list then lives in one file instead of
+two, and the access log stops recording a Cloudflare address for every request.
+
+`set_real_ip_from` is only sound while the origin cannot be reached except
+through Cloudflare. Pair it with an origin firewall that accepts only
+Cloudflare's ranges (or a `cloudflared` tunnel) and Authenticated Origin Pulls
+— otherwise anyone who finds the origin IP, or routes to it through their own
+Cloudflare zone, can set `CF-Connecting-IP` themselves.
+
+**Alternative: trust the edge in the chat server.** Put Cloudflare's published
+ranges in `trusted_public_proxies`, not `trusted_proxies`, and say why:
+
+```toml
+trusted_proxies = ["127.0.0.0/8", "::1", "172.16.0.0/12"]
+trusted_public_proxies = [
+  "173.245.48.0/20", "103.21.244.0/22", "162.158.0.0/15", "104.16.0.0/13",
+  # ...the rest of cloudflare.com/ips-v4 and ips-v6
+]
+trusted_public_proxies_reason = "Cloudflare edge, refreshed 2026-09-20"
+```
+
+The two keys are one trust list, not two — entries in either are trusted
+identically and you must not repeat them. What the separate key does is record
+that you meant it. The server warns at startup about any range reaching outside
+loopback and the private ranges that is **not** written under
+`trusted_public_proxies`, so a public range added later is still called out; and
+it warns about a range too wide to be an edge fleet (`0.0.0.0/0`, `::/0`, a
+public `/8`) whichever key it is in. A `trusted_public_proxies` list with an
+empty reason is also still warned about. What you get on a correct
+CDN-fronted config is one `info` line at boot naming the ranges and the reason
+— which is worth reading, because diffing it across restarts is how you see the
+list change.
+
+Before v0.0.49 there was no second key and the server logged one warning per
+public range, which on a Cloudflare-fronted deployment meant a screenful of
+correct warnings on every boot. Moving the ranges from `trusted_proxies` to
+`trusted_public_proxies` is the upgrade step; nothing breaks if you don't, you
+just keep getting told (once, now, rather than per range).
+
+### Keeping the Cloudflare list current
+
+Whichever of the two you pick, **nothing fetches the list for you.** The server
+ships no built-in copy on purpose: a list compiled into a release is wrong in
+both directions the moment Cloudflare changes it — blessing ranges they have
+given up, warning about ones they have just added — and it would put a third
+party in charge of whose `X-Forwarded-For` your rate limiter believes.
+
+Refresh by hand from <https://www.cloudflare.com/ips-v4> and
+<https://www.cloudflare.com/ips-v6>, and move the date in
+`trusted_public_proxies_reason` (or the comment in the nginx block) along when
+you do. Out of date in each direction:
+
+* **Cloudflare adds a range you do not have.** Clients arriving through those
+  edge nodes share one rate-limit bucket. The symptom is the server's runtime
+  warning that `X-Forwarded-For` arrived from a peer that is not trusted — that
+  warning is throttled to once a minute, so look for it rather than expecting
+  it to be loud.
+* **Cloudflare gives a range up.** You go on trusting it after it is reassigned
+  to somebody else, who can then forge `X-Forwarded-For`. This is the direction
+  that matters and the only thing that catches it is the date.
+
 ## Push notifications
 
 Off by default, because nothing in `docker-compose.yml` provides a push

@@ -206,6 +206,72 @@ log_format bsfchat '$remote_addr - $remote_user [$time_local] '
                    '"$request_method $loggable_uri $server_protocol" '
                    '$status $body_bytes_sent "$http_referer" "$http_user_agent"';
 
+# ---------------------------------------------------------------------------
+# BEHIND A CDN (Cloudflare): resolve the real client here
+# ---------------------------------------------------------------------------
+# With Cloudflare in front, $remote_addr is a Cloudflare edge node on every
+# request, and `$proxy_add_x_forwarded_for` below appends that public address
+# to X-Forwarded-For. The chat server then sees Cloudflare as the rightmost
+# hop, and unless it has been told to trust the whole Cloudflare edge, every
+# one of your users ends up in a single rate-limit bucket on /login — one
+# person retrying a bad password locks the server out of signing anybody in.
+#
+# There are two ways to fix that, and this is the better one. Uncomment the
+# block below and nginx rewrites $remote_addr to the real client BEFORE it
+# builds X-Forwarded-For, so the chat server only ever has to trust nginx:
+# leave auth.trusted_proxies at loopback + the Docker bridge and leave
+# auth.trusted_public_proxies empty. The CDN range list then lives in exactly
+# one place — here — instead of being maintained twice. It also fixes the
+# access log, which currently records a Cloudflare address for every request.
+#
+# The alternative is to list the Cloudflare ranges in the chat server's
+# auth.trusted_public_proxies (with a reason). That works, but it means the
+# server believes an X-Forwarded-For built by a machine you do not run, and it
+# is a second copy of the list to keep current.
+#
+# Either way the ranges have to be refreshed by hand from
+# https://www.cloudflare.com/ips-v4 and https://www.cloudflare.com/ips-v6.
+# They change. A range Cloudflare adds that is not listed here puts the clients
+# behind it back in one bucket; a range it gives up stays trusted after
+# somebody else is issued it.
+#
+# Read CF-Connecting-IP rather than X-Forwarded-For: Cloudflare overwrites
+# CF-Connecting-IP with the address it observed and it is the single value it
+# vouches for, whereas a client-supplied X-Forwarded-For is passed through.
+#
+# NOTE: set_real_ip_from is only safe while the origin cannot be reached except
+# through Cloudflare. If someone can hit the origin IP directly, or route to it
+# through their own Cloudflare zone, they can present these headers themselves.
+# Pair this with an origin firewall that accepts only Cloudflare's ranges (or a
+# cloudflared tunnel) and Authenticated Origin Pulls.
+#
+# Last refreshed: (fill in the date when you paste the current lists)
+#
+# set_real_ip_from 173.245.48.0/20;
+# set_real_ip_from 103.21.244.0/22;
+# set_real_ip_from 103.22.200.0/22;
+# set_real_ip_from 103.31.4.0/22;
+# set_real_ip_from 141.101.64.0/18;
+# set_real_ip_from 108.162.192.0/18;
+# set_real_ip_from 190.93.240.0/20;
+# set_real_ip_from 188.114.96.0/20;
+# set_real_ip_from 197.234.240.0/22;
+# set_real_ip_from 198.41.128.0/17;
+# set_real_ip_from 162.158.0.0/15;
+# set_real_ip_from 104.16.0.0/13;
+# set_real_ip_from 104.24.0.0/14;
+# set_real_ip_from 172.64.0.0/13;
+# set_real_ip_from 131.0.72.0/22;
+# set_real_ip_from 2400:cb00::/32;
+# set_real_ip_from 2606:4700::/32;
+# set_real_ip_from 2803:f800::/32;
+# set_real_ip_from 2405:b500::/32;
+# set_real_ip_from 2405:8100::/32;
+# set_real_ip_from 2a06:98c0::/29;
+# set_real_ip_from 2c0f:f248::/32;
+# real_ip_header CF-Connecting-IP;
+# real_ip_recursive off;
+
 # --- chat server (port 80) -------------------------------------------------
 server {
     listen 80;
