@@ -42,6 +42,34 @@ login_max_failures = 8       # consecutive failures before a temporary lockout
 login_lockout_seconds = 900
 totp_max_attempts = 5        # wrong 2FA codes before the login token is burned
 
+# Reverse proxies whose X-Forwarded-For the identity service believes. Same
+# meaning as trusted_proxies in server.toml.
+#
+# nginx runs on the host and reaches this container through Docker's port
+# publishing, so the TCP peer the service sees is the Docker bridge gateway
+# (172.16.0.0/12), for every user. Without this line the service ignores
+# X-Forwarded-For and every user shares ONE rate-limit bucket: ten logins per
+# five minutes for the whole platform. (Before identity's security fixes of
+# 2026-09 it was worse: eight bad passwords from anyone locked every user out
+# of signing in for 15 minutes.)
+#
+# Only the bridge is listed. With Cloudflare in front, turn on the
+# set_real_ip_from / real_ip_header CF-Connecting-IP block in
+# nginx/bsfchat.conf so nginx puts the real client into X-Forwarded-For; do NOT
+# add Cloudflare's ranges here as well. If nginx cannot do that, list them
+# under trusted_public_proxies with a trusted_public_proxies_reason instead.
+#
+# Identity builds older than the 2026-09 security fixes ignore these keys.
+# Confirm it took: after a restart the log must NOT show "carry
+# X-Forwarded-For, but that network is not in [auth] trusted_proxies".
+trusted_proxies = ["172.16.0.0/12"]
+
+# How long the desktop client stays signed in. A refresh token is renewed on
+# each use by the idle lifetime, but never past the absolute lifetime of the
+# original sign-in.
+refresh_token_idle_days = 30
+refresh_token_max_lifetime_days = 90
+
 [housekeeping]
 # How often expired sessions, auth codes, login tokens, consent requests and
 # refresh tokens are deleted.
