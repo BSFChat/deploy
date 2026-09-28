@@ -18,11 +18,54 @@
 #   ID_HOST   -> localhost:8480 (identity service)
 # coturn is NOT proxied — TURN is not HTTP.
 
+# ---------------------------------------------------------------------------
+# Container log retention
+# ---------------------------------------------------------------------------
+# Docker's default json-file driver has NO size and NO age limit, so without
+# this block the chat server's and identity service's own stdout grows under
+# /var/lib/docker/containers/ until the disk fills. Neither logrotate/nginx nor
+# ./backup.sh touches it — those cover a different log. A daemon-wide default in
+# /etc/docker/daemon.json would also work; it lives here instead so the numbers
+# are committed, reviewable, and applied by `docker compose up -d` rather than
+# by a host file nobody remembers editing.
+#
+# READ THIS BEFORE QUOTING A RETENTION PERIOD ANYWHERE. This is a SIZE bound,
+# not an age bound. json-file exposes max-size, max-file and compress and
+# nothing else — `max-age` and `max-file-age` are rejected by the daemon as
+# unknown options (verified against Docker 29.0.1). So a busy server discards
+# lines in days and a quiet one can keep them for the better part of a year.
+# Do not write "we keep container logs for N days" on the strength of this
+# block. If you need an actual period, see "Container logs" in README.md: it
+# takes the journald driver plus MaxRetentionSec on the host, and that is a
+# different trade, not a bigger number here.
+#
+# Why 10m x 3. The ceiling is max-size x max-file — the live file counts as one
+# of them — so 30 MB per service, 60 MB for the two that log. Measured, not
+# guessed: json-file wraps every line in
+# {"log":"...","stream":"stdout","time":"<RFC3339Nano>"}, a fixed 68 bytes on
+# top of the line itself. A representative line here —
+# "[2026-09-28 14:22:01.123] [info] User @alice:chat.bsfchat.com joined voice in
+# room !GtKqPZmXvNwRbYcD:chat.bsfchat.com" — is about 113 bytes, so ~181 on
+# disk, and 30 MB holds roughly 165,000 of them. At the few hundred lines a day
+# a small instance actually produces that is months of history; at the ~580
+# lines a day a permanently unreachable identity provider adds (the OIDC retry
+# backoff caps at 300s) it is still months. It is sized to survive a bad day
+# without being the reason a 25 GB VPS fills up.
+#
+# Override per host in .env if you want more history; the defaults apply when
+# the variables are unset.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "${BSFCHAT_LOG_MAX_SIZE:-10m}"
+    max-file: "${BSFCHAT_LOG_MAX_FILE:-3}"
+
 services:
   server:
     image: ghcr.io/bsfchat/server:${BSFCHAT_TAG:-latest}
     container_name: bsfchat-server
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "127.0.0.1:8448:8448"
     volumes:
@@ -38,6 +81,7 @@ services:
     image: ghcr.io/bsfchat/identity:${BSFCHAT_TAG:-latest}
     container_name: bsfchat-identity
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "127.0.0.1:8480:8480"
     volumes:
@@ -62,6 +106,18 @@ services:
     image: coturn/coturn:${COTURN_TAG:-4.11.0}
     container_name: bsfchat-coturn
     restart: unless-stopped
+    # Present for uniformity and to catch a future config change, NOT because
+    # coturn currently fills this file. As shipped it writes nothing at all to
+    # stdout: it opens its own log and, running as nobody, falls back from
+    # /var/log to /var/tmp/turn_<pid>_<date>.log INSIDE the container, where
+    # `docker logs` cannot see it and this block cannot bound it. That file is
+    # cleared only when the container is recreated, which under
+    # `restart: unless-stopped` can be months. At the verbosity this config
+    # uses it holds startup banner lines and the server's own listener and
+    # relay addresses — no client addresses, no usernames, no session lines;
+    # those appear only with `verbose`. Turn verbosity up and you are creating
+    # an unbounded log of who called whom that nothing here rotates.
+    logging: *default-logging
     # Host networking: publishing ~2000 UDP ports through the bridge would
     # spawn a userland proxy per port, and coturn would still advertise the
     # container address as the relay candidate.

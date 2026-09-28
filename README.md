@@ -980,6 +980,167 @@ docker compose logs -f           # all services
 docker compose logs -f server    # just the chat server
 ```
 
-These are the application logs. The reverse proxy's access logs are a separate
+These are the application logs: the chat server's and identity service's own
+stdout, captured by Docker. The reverse proxy's access logs are a separate
 thing with a separate hazard — see "Access logs" above before you copy them
-anywhere.
+anywhere. coturn's log is a third thing again and is not either of these; see
+the end of this section.
+
+### What is actually in them
+
+Worth knowing before you paste one into an issue, and before you decide how
+long to keep them. Both services log at `info` and **the level is not
+configurable** — `init_logger("info")` is a literal in each service's
+`main.cpp`, with no config key and no flag. You cannot quiet these lines down;
+you can only decide how long they live.
+
+What the lines contain:
+
+- **Account identifiers, constantly.** Every login, registration, password
+  change, session revocation and account deactivation is logged with the user
+  id. So is every room creation and join, every kick, ban, unban and invite
+  (actor *and* target), every voice join and leave, every media upload with its
+  uploader, and every content or user report with both the reporter and the
+  person reported. Taken together that is a per-account timeline of when
+  somebody was online, which channels they were in, who they spoke to in voice
+  and who they reported — which is a good deal more revealing than an nginx
+  access line, and it is the reason this is a privacy question and not only a
+  disk question.
+- **Room and channel ids**, alongside those account ids.
+- **Usernames.** The identity service logs `Account created: <username> (<id>)`.
+- **The OIDC subject** on an identity login, next to the local user id.
+- **Nicknames, as free text** — `User X set nickname of Y to '<whatever they
+  typed>'` is the one place user-authored content reaches the log. It cannot
+  forge log records (`validate_nickname` rejects control, invisible and
+  bidi codepoints before it is stored), but it is somebody's chosen text.
+
+What they do **not** contain, each checked rather than assumed:
+
+- **No message content, ever.** Nothing logs an event body. The closest thing
+  is a report line, which records the report's id and score but not the
+  reported text.
+- **No tokens, secrets or password hashes.** Config warnings name keys and
+  print `set`/`missing`, never values; the instance secret is logged as having
+  been generated, not as a value. The unhandled-exception handler prints the
+  matched **route pattern** rather than the raw path where it can, and
+  `httplib` keeps the query string out of `req.path` in any case, so the media
+  token that rides in a query parameter does not land here the way it can in
+  nginx's error log.
+- **No full IP addresses.** Every address that reaches these logs goes through
+  a redactor first: IPv4 is truncated to a `/24` and IPv6 to a `/64`. That is
+  deliberate and it is worth not undoing.
+
+### How long they are kept, and why that is not a number of days
+
+`docker-compose.yml` now sets a `logging:` block on every service. Before it,
+Docker's default `json-file` driver kept this output under
+`/var/lib/docker/containers/` **with no size limit and no age limit** — it grew
+until the disk filled. `logrotate/nginx` never touched it and neither does
+`./backup.sh`.
+
+The block caps each service at `max-size` x `max-file` = **30 MB** by default,
+which for these lines is roughly 165,000 of them. The arithmetic and the
+measured per-line overhead are in the comment above `x-logging:` in
+`docker-compose.yml`.
+
+**This is a size bound and not a retention period, and the difference matters
+if you publish one.** Docker's `json-file` driver takes `max-size`, `max-file`
+and `compress` and nothing else; `max-age` and `max-file-age` are rejected by
+the daemon as unknown options. So the oldest line in the ring is however old
+the traffic happens to make it: a busy server drops lines inside a week, and a
+quiet server — the likely case for a small instance — can hold months. That is
+the same shape of trap as `notifempty` in `logrotate/nginx`: the mechanism
+keeps the most data on the deployments that look healthiest, because they are
+the ones producing the fewest lines.
+
+If you need container logs to expire on a clock the way the nginx logs do, a
+size cap will not get you there and neither will a bigger one. The route that
+does:
+
+```bash
+# 1. Switch the driver in docker-compose.yml — replace the `logging:` line on
+#    each service with:
+#        logging:
+#          driver: journald
+#
+# 2. Make the journal persistent. Without this it is volatile (RAM only) and
+#    every container log is lost on reboot, which is a different retention
+#    policy than the one you meant to set.
+sudo mkdir -p /var/log/journal
+sudo systemd-tmpfiles --create
+
+# 3. Give journald the period, as a DROP-IN rather than an edit to the packaged
+#    journald.conf. A drop-in survives a package upgrade, and it cannot fail
+#    silently the way `sed -i` over the packaged file does: on a host where the
+#    commented `#MaxRetentionSec=` line is missing, that sed matches nothing,
+#    changes nothing, and exits 0.
+sudo install -d -m 0755 /etc/systemd/journald.conf.d
+printf '[Journal]\nMaxRetentionSec=14d\n' \
+  | sudo tee /etc/systemd/journald.conf.d/10-bsfchat-retention.conf
+sudo systemctl restart systemd-journald
+
+# 4. Prove journald agrees, BEFORE trusting it. This prints the value in
+#    effect, not the value in the file you just wrote.
+journalctl --header 2>/dev/null | head -3
+sudo systemd-analyze cat-config systemd/journald.conf | grep -i maxretention
+
+# 5. Recreate the containers onto the new driver, then prove it reads back.
+sudo docker compose up -d
+docker inspect -f '{{.Name}} {{json .HostConfig.LogConfig}}' $(docker compose ps -q)
+journalctl CONTAINER_NAME=bsfchat-server -n 20
+```
+
+`docker compose logs` keeps working on the journald driver. What you give up
+is a per-container cap: retention becomes global and shares `SystemMaxUse` with
+every other unit on the box, so a noisy neighbour can evict chat-server lines
+early and a chat-server flood can evict everything else. That is a real trade,
+which is why the shipped default is the size cap — it needs no host state, it
+cannot be silently un-done by an unrelated edit to `journald.conf`, and its
+failure mode is losing old logs rather than filling a disk.
+
+### Check what your host is actually doing
+
+None of the following can be answered from this repository; run them on the
+server.
+
+```bash
+# Is there a daemon-wide default that would apply instead? (This file wins for
+# containers created before the compose block existed.)
+cat /etc/docker/daemon.json 2>/dev/null || echo 'no daemon.json'
+
+# What are the RUNNING containers using? A logging: block only takes effect on
+# a container that has been recreated since it was added, so this can disagree
+# with docker-compose.yml until you `docker compose up -d`.
+docker inspect -f '{{.Name}} {{json .HostConfig.LogConfig}}' $(docker compose ps -q)
+
+# How much is on disk right now, and which container owns it?
+sudo du -sh /var/lib/docker/containers/
+sudo du -sh /var/lib/docker/containers/*/ | sort -h | tail -5
+```
+
+If that last number is already large, the cap does **not** retroactively shrink
+it: Docker applies `max-size` as the live file grows past it, so an existing
+400 MB log is trimmed only as new lines arrive. Recreating the containers
+(`docker compose up -d --force-recreate`) starts fresh files and discards the
+old ones, which is the quick way to reclaim the space — at the cost of the
+history in them.
+
+### coturn's log is not here
+
+coturn as configured writes **nothing** to stdout, so `docker logs coturn` is
+empty and the `logging:` block above never sees anything from it. It opens its
+own log file instead and, running as `nobody`, falls back from `/var/log` to
+`/var/tmp/turn_<pid>_<date>.log` **inside the container** — invisible to
+`docker logs`, unbounded by anything in this repo, and cleared only when the
+container is recreated, which under `restart: unless-stopped` may be months.
+
+At the verbosity `config/turnserver.conf.template` uses, that file holds the
+startup banner and the server's own listener and relay addresses. It does not
+hold client addresses, usernames or per-session lines — those appear only if
+you add `verbose`. If you ever do, understand what you have created: an
+unbounded record, inside a container, of which addresses called which, that
+nothing in this repo rotates and no backup captures.
+
+```bash
+docker compose exec coturn sh -c 'ls -la /var/tmp/turn_*.log'
+```
