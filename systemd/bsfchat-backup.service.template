@@ -1,0 +1,113 @@
+# ===========================================================================
+#  BSFChat nightly backup — rendered by ./setup.sh, installed by hand
+# ===========================================================================
+#  ./setup.sh renders this template to systemd/bsfchat-backup.service with
+#  this deployment's real directory and retention period substituted in. It
+#  does NOT install it: copying it to /etc/systemd/system is a step in the
+#  runbook (README.md, "Retention and rotation"), because installing a timer
+#  that writes a complete plaintext copy of the server every night is not
+#  something a config-rendering script should do behind your back.
+#
+#  Re-rendering does not update the installed copy either. ./setup.sh --check
+#  warns when the two have drifted, the same way it does for the nginx config
+#  — a mechanism that exists because production ran a hand-edited nginx
+#  timeout for months while this repo said otherwise and nothing diffed them.
+#
+#  It is a template rather than a fixed file for one reason: every path in a
+#  unit file has to be absolute, and a unit with the wrong absolute path fails
+#  in the quietest possible way — a timer that fires on schedule, forever, and
+#  never produces a backup.
+#
+# ---------------------------------------------------------------------------
+#  This unit automates a real new exposure. Read this before enabling it.
+# ---------------------------------------------------------------------------
+#  Each archive is a complete plaintext copy of the deployment: every message
+#  ever sent, the audit log, every uploaded file, the OIDC RSA signing key
+#  (which mints tokens for any account) and .env (which holds the TURN shared
+#  secret). Nothing in it is encrypted.
+#
+#  One of those taken by hand and encrypted off the host is a different thing
+#  from ${BACKUP_RETENTION_DAYS} of them sitting next to the service that produced them. This
+#  unit does not solve that; it bounds it. What it does do is refuse to run
+#  rather than let it get quietly worse: both commands below pass
+#  --require-private-dest, so if the destination directory ever gives away a
+#  group or other bit the unit fails loudly instead of spending a month
+#  writing world-readable copies of every conversation on the server.
+#
+#  Encrypting these archives at rest, and getting them off this host, is still
+#  an open problem and this unit does not close it. See "Retention and
+#  rotation" in README.md.
+# ---------------------------------------------------------------------------
+
+[Unit]
+Description=BSFChat nightly backup (consistent SQLite snapshot, ${BACKUP_RETENTION_DAYS}-day retention)
+Documentation=file://${DEPLOY_DIR}/README.md
+Documentation=file://${DEPLOY_DIR}/backup.sh
+
+# Deliberately no After=docker.service and no dependency on the containers.
+# backup.sh does not talk to docker at all: it reads the database files
+# directly and uses the host's sqlite3 to take an online snapshot through
+# SQLite's backup API, which is consistent against a database that is being
+# written to. A backup that waited for docker would be a backup that does not
+# happen when the service is down, which is when you most want one.
+
+[Service]
+Type=oneshot
+WorkingDirectory=${DEPLOY_DIR}
+
+# Everything this writes is a full copy of the server's secrets. backup.sh
+# sets its own umask too; this is the belt to that braces, and it also covers
+# the shell systemd starts it in.
+UMask=0077
+
+# Copying the media directory is the heavy part of this and it runs while the
+# service is live. Give the real workload the disk and the CPU.
+Nice=19
+IOSchedulingClass=idle
+
+# A first backup on a server with a lot of media can take a while, and the
+# default 90s start timeout would kill it partway through. backup.sh stages
+# into a .partial directory and cleans up on signal, so a timeout is not
+# corrupting anything — it just wastes the run.
+TimeoutStartSec=3600
+
+# RETENTION RUNS FIRST, BEFORE THE BACKUP. This looks backwards and is not:
+#
+#   * retention is a privacy obligation. The privacy policy states a period,
+#     so enforcement must not be conditional on tonight's backup succeeding.
+#     Pruning afterwards means a backup that fails for a month silently stops
+#     deleting anything and the deployment holds archives past the period it
+#     committed to, with nothing saying so.
+#   * pruning first also frees the space the new archive needs, so a disk that
+#     filled up recovers on the next run instead of deadlocking: backup fails
+#     for want of space, prune never runs, space is never freed.
+#
+# ExecStartPre failing aborts the unit, which is what should happen — if
+# retention cannot run, this host should be in `failed` state until somebody
+# looks. The trade-off is that backups failing every night for longer than the
+# retention period will eventually delete the last archive. That is the
+# policy-correct outcome and a loud one: the unit is failed nightly for
+# ${BACKUP_RETENTION_DAYS} days first, and the prune says "there are now NO backups" when it
+# happens. Watch it (see the runbook) rather than trading the guarantee away.
+ExecStartPre=${DEPLOY_DIR}/backup.sh --prune-only --prune-older-than ${BACKUP_RETENTION_DAYS} --require-private-dest ${DEPLOY_DIR}/backups
+ExecStart=${DEPLOY_DIR}/backup.sh --require-private-dest ${DEPLOY_DIR}/backups
+
+# Output goes to the journal. `journalctl -u bsfchat-backup.service` is then
+# the log, with no second file to rotate and no risk of the backup log itself
+# growing without bound — which is what the cron line this replaces did.
+StandardOutput=journal
+StandardError=journal
+
+# NO systemd sandboxing here, on purpose. The obvious hardening is actively
+# wrong for this unit: ProtectHome=true hides /root, and this deployment lives
+# in /root/bsfchat/deploy, so it would break the backup outright while looking
+# like a security improvement. ProtectSystem=strict needs a ReadWritePaths for
+# the deploy directory and would have to be revisited every time the layout
+# moves. A root oneshot whose entire job is to read every file in the
+# deployment and write an archive has little left to take away; silent
+# breakage is the bigger risk here than a narrower sandbox.
+
+[Install]
+# Not WantedBy anything: the timer starts this, and the timer is what gets
+# enabled. `systemctl enable bsfchat-backup.service` would be a no-op that
+# looks like it did something.

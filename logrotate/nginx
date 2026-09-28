@@ -1,0 +1,165 @@
+# ===========================================================================
+#  BSFChat — nginx log rotation with a 14-day retention period
+# ===========================================================================
+#  INSTALLS AS /etc/logrotate.d/nginx — REPLACING the file the nginx package
+#  ships, not sitting beside it. Installing it alongside under any other name
+#  is broken in two ways, both verified against logrotate 3.22:
+#
+#    * logrotate reads /etc/logrotate.d in ALPHABETICAL order and the second
+#      file to claim a path loses. `bsfchat-nginx` sorts before `nginx` so it
+#      would win today; a file named `zz-nginx` would silently lose and you
+#      would be running the distro's retention while this file sat on disk
+#      looking authoritative. Whose retention period applies must not depend
+#      on a filename's sort order.
+#    * the losing entry prints `error: duplicate log entry for
+#      /var/log/nginx/access.log` and the whole logrotate run EXITS 1. Under
+#      systemd that puts logrotate.service into `failed` state every night,
+#      which buries any real rotation failure for every other log on the box.
+#
+#  So: back the packaged file up, overwrite it, and expect dpkg to ask about
+#  the modified conffile the next time nginx is upgraded (keeping the local
+#  version is the right answer). The exact commands, in order, with the
+#  verification for each, are in README.md under "Retention and rotation".
+#
+# ---------------------------------------------------------------------------
+#  Why this is a security control and not housekeeping
+# ---------------------------------------------------------------------------
+#  Rotation here bounds how long a leaked credential stays on disk, which is
+#  why the period is in the privacy policy rather than in a tuning guide.
+#
+#  The `bsfchat` log format in nginx/bsfchat.conf.template keeps session
+#  tokens out of the ACCESS log. Nothing keeps them out of the ERROR log:
+#  nginx has no log_format for it, its entries carry the request line exactly
+#  as received, and the desktop client fetches media with the token as a query
+#  parameter. So an error-level line about a media request contains a working
+#  bearer token — and because token expiry slides forward on use, a line from
+#  last week can still be a live credential today. The full reasoning, and the
+#  reason suppression is not enabled by default, is in the "ERROR LOGGING"
+#  block of nginx/bsfchat.conf.template.
+#
+#  The glob below therefore covers error.log deliberately, not incidentally.
+#  If you ever narrow this to access.log you have removed the only expiry on
+#  the tokens in the error log.
+#
+#  Note also what rotation does NOT do: it is forward-only. Logs already on
+#  this host, and every rotated archive of them, keep whatever they already
+#  contain until this config ages them out. Step 1 of the runbook truncates
+#  them for that reason.
+# ---------------------------------------------------------------------------
+
+/var/log/nginx/*.log {
+    # ----------------------------------------------------------------------
+    # The retention period. 14 days, stated in the privacy policy.
+    # ----------------------------------------------------------------------
+    # `daily` + `rotate 14` is the period. `maxage 14` is not redundant with
+    # it: `rotate` counts rotations, not days, so if logrotate does not run
+    # for a stretch (host powered off, timer masked, a run that exited 1
+    # because of the duplicate-entry trap above) the numbered files fall
+    # behind the calendar and .14 can be well over 14 days old. `maxage`
+    # deletes by mtime and catches exactly that case.
+    #
+    # Granularity, stated plainly because the policy quotes this number: a
+    # line is deleted at most 14 days after the rotation that captured it, so
+    # a line written just after one rotation can live a few hours short of 15
+    # days. The period is a ceiling of 14 days on rotated data, not a promise
+    # about the file currently being written.
+    daily
+    rotate 14
+    maxage 14
+
+    # ----------------------------------------------------------------------
+    # NO `notifempty` — this is the subtle one, and it is tested
+    # ----------------------------------------------------------------------
+    # The nginx package's own config sets `notifempty`, and combining it with
+    # this glob quietly breaks retention on the one log that matters most.
+    #
+    # With `notifempty`, logrotate skips an empty log — and skipping it skips
+    # the pruning step too, so `maxage` never runs for that log. Verified
+    # against logrotate 3.22 with an empty error.log and 20-day-old
+    # error.log.{2,3,4}.gz beside it: logrotate reported "log does not need
+    # rotating (log is empty)" and removed none of them. Without
+    # `notifempty`, the same fixture rotated and deleted all three.
+    #
+    # On a healthy deployment error.log IS usually empty — that is the point
+    # of the tuning in nginx/bsfchat.conf.template — so `notifempty` would
+    # leave token-bearing error.log archives on disk indefinitely on exactly
+    # the servers that look healthiest. The cost of omitting it is up to 14
+    # near-empty compressed files. That is the trade, and it is not close.
+    missingok
+
+    # ----------------------------------------------------------------------
+    # Compression
+    # ----------------------------------------------------------------------
+    # `delaycompress` defers compression by one cycle. Worth keeping even
+    # though the postrotate signal below makes nginx reopen promptly: the
+    # reopen is not instantaneous across workers, and a worker still holding
+    # the old descriptor would otherwise be appending to a file logrotate is
+    # compressing. One cycle of delay costs nothing here.
+    compress
+    delaycompress
+
+    # ----------------------------------------------------------------------
+    # Mode of the new file
+    # ----------------------------------------------------------------------
+    # The owner MUST be the user nginx's worker processes run as. nginx
+    # reopens its logs on USR1 in the workers as well as the master, so a file
+    # they cannot write means logging silently stops — the service keeps
+    # serving and the logs just end. `www-data` is the Debian/Ubuntu default
+    # and what the packaged config assumes; VERIFY IT on your host rather than
+    # trusting this line:
+    #
+    #     nginx -T 2>/dev/null | grep -E '^\s*user\s'
+    #     ps -o user=,comm= -C nginx
+    #
+    # 0600, not the packaged config's 0640: the group is `adm`, and the error
+    # log can contain live session tokens (see above). Group read here widens
+    # who can lift one from every member of `adm` to nobody but the owner and
+    # root, and nothing in this deployment reads nginx's logs as a non-root
+    # user. The group is still named so that ownership matches the packaged
+    # config if you ever put the group bit back.
+    #
+    # This applies to newly created files only — a rename preserves the old
+    # file's mode, so logs already on disk keep theirs until they age out.
+    # Step 1 of the runbook chmods them.
+    create 0600 www-data adm
+
+    # ----------------------------------------------------------------------
+    # Signal nginx once, after all the files in the glob have moved
+    # ----------------------------------------------------------------------
+    # `sharedscripts` is required, not stylistic: without it the postrotate
+    # script runs once per matched file, so nginx gets a USR1 after access.log
+    # moves and before error.log does, and writes to a descriptor pointing at
+    # a file that is about to be renamed under it.
+    #
+    # USR1 rather than `systemctl reload nginx`: USR1 reopens log files and
+    # nothing else. A reload re-reads the whole configuration, so a config
+    # error unrelated to logging would turn every rotation into a failed
+    # rotation, and a reload also cycles workers, which drops the /sync long
+    # polls this deployment depends on.
+    #
+    # /run/nginx.pid is the modern path; /var/run is a symlink to it on any
+    # current distro, but is checked second for older hosts where it is a real
+    # directory. If neither exists nginx is not running, and there is nothing
+    # to signal — the rotation itself is still correct.
+    sharedscripts
+    postrotate
+        if [ -f /run/nginx.pid ]; then
+            kill -USR1 "$(cat /run/nginx.pid)"
+        elif [ -f /var/run/nginx.pid ]; then
+            kill -USR1 "$(cat /var/run/nginx.pid)"
+        fi
+    endscript
+
+    # ----------------------------------------------------------------------
+    # Not enabled: size-triggered rotation
+    # ----------------------------------------------------------------------
+    # `maxsize` rotates early when a log passes a size, which caps worst-case
+    # disk during a flood or a crash loop. It is left off because it shortens
+    # retention rather than lengthening it — under a flood you would burn
+    # through all 14 rotations in a day and lose the diagnostics for the
+    # incident you are trying to read. Deleting sooner than 14 days never
+    # breaks the policy's ceiling, so turning this on is safe if this host is
+    # tight on disk. Uncomment and pick a size that 14 of will fit:
+    #
+    # maxsize 256M
+}
