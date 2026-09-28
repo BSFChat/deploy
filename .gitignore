@@ -16,6 +16,12 @@ config/identity.toml
 config/turnserver.conf
 nginx/bsfchat.conf
 
+# The systemd unit rendered by ./setup.sh from the .template beside it. Not a
+# secret — it names this deployment's directory and its retention period — but
+# it is generated, and a committed copy would carry one host's absolute paths
+# into everybody else's checkout.
+systemd/bsfchat-backup.service
+
 # Backup archives written by ./backup.sh. These are the single most sensitive
 # artefact this deployment produces: a complete plaintext copy of every message,
 # the OIDC signing key and the TURN secret. They belong nowhere near git.

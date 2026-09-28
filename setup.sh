@@ -34,10 +34,32 @@ cd "$(dirname "$0")"
 SERVER_UID=10001
 COTURN_UID=${COTURN_UID:-65534}
 
+# Absolute path of this deployment, for the systemd unit. Every path in a unit
+# file has to be absolute, and a unit with the wrong one fails in the quietest
+# way there is: a timer that fires on schedule forever and never produces a
+# backup. -P so that a deployment reached through a symlink gets the real path
+# written into the unit rather than a link that may not resolve the same way
+# for systemd.
+DEPLOY_DIR=$(pwd -P)
+
 CHECK_ONLY=0
 [ "${1:-}" = "--check" ] && CHECK_ONLY=1
 
 die() { printf '\n  ERROR: %s\n\n' "$1" >&2; exit 1; }
+
+# systemd splits ExecStart on whitespace and there is no way to quote a path
+# through the rendering done here, so a deployment directory with a space in it
+# would render a unit that parses as a different command with different
+# arguments. Refuse rather than write one: the failure is a nightly backup that
+# never runs, which is invisible until it is needed.
+case "$DEPLOY_DIR" in
+    *[[:space:]]*)
+        die "This deployment's directory contains whitespace:
+           $DEPLOY_DIR
+         systemd splits a unit's ExecStart on whitespace, so the nightly backup
+         unit cannot be rendered for this path. Move the deployment somewhere
+         without spaces in the path." ;;
+esac
 
 # Warn when the nginx config installed on this box is not the one this repo
 # renders.
@@ -74,6 +96,27 @@ check_installed_nginx() {
     note "         next run does not reinstate the difference. If this file is"
     note "         right, install it and reload:"
     note "             cp nginx/bsfchat.conf $installed && nginx -t && systemctl reload nginx"
+}
+
+# Same class of problem as check_installed_nginx, same treatment: rendering a
+# unit file is not installing it, and systemd reads its own copy under
+# /etc/systemd/system. A stale installed unit here means the nightly backup is
+# running with the previous retention period — or against the previous
+# directory, in which case it has not been running at all.
+check_installed_unit() {
+    installed=/etc/systemd/system/bsfchat-backup.service
+    [ -e "$installed" ] || return 0
+    [ -r "$installed" ] || return 0          # not root; say nothing rather than guess
+    cmp -s "$installed" systemd/bsfchat-backup.service && return 0
+
+    note "WARNING: $installed differs from systemd/bsfchat-backup.service."
+    note "         systemd runs the installed copy, so the nightly backup may be"
+    note "         using a different retention period or directory than the one"
+    note "         rendered here. See it with:"
+    note "             diff -u $installed systemd/bsfchat-backup.service"
+    note "         If this file is right:"
+    note "             cp systemd/bsfchat-backup.service $installed"
+    note "             systemctl daemon-reload"
 }
 note() { printf '  %s\n' "$1"; }
 
@@ -174,9 +217,32 @@ fi
 # by nginx (bare HTML 413 the client cannot interpret).
 NGINX_MAX_BODY_MB=$(( MAX_UPLOAD_MB + 8 ))
 
+# How long the nightly backup keeps its archives. Defaulted rather than
+# required, so an existing .env from before this setting existed still renders
+# — but defaulted to the number the privacy policy states, not to something
+# permissive, because the unit rendered from it is what makes that sentence
+# true.
+BACKUP_RETENTION_DAYS=${BACKUP_RETENTION_DAYS:-30}
+case "$BACKUP_RETENTION_DAYS" in
+    ''|*[!0-9]*) die "BACKUP_RETENTION_DAYS must be a whole number of days, got:
+         $BACKUP_RETENTION_DAYS" ;;
+esac
+[ "$BACKUP_RETENTION_DAYS" -ge 1 ] ||
+    die "BACKUP_RETENTION_DAYS is $BACKUP_RETENTION_DAYS. A retention period of
+         zero days would delete each night's backup as soon as it was taken.
+         To stop taking backups, disable bsfchat-backup.timer instead."
+if [ "$BACKUP_RETENTION_DAYS" -gt 30 ]; then
+    note "WARNING: BACKUP_RETENTION_DAYS=$BACKUP_RETENTION_DAYS, but bsfchat.com/privacy"
+    note "         states thirty days. Every archive is a complete plaintext copy"
+    note "         of every message on this server, the OIDC signing key and the"
+    note "         TURN secret. If you run your own BSFChat this is your call —"
+    note "         but say the real number in whatever you have told your users."
+fi
+
 if [ "$CHECK_ONLY" = 1 ]; then
     for f in config/server.toml config/identity.toml \
-             config/turnserver.conf nginx/bsfchat.conf; do
+             config/turnserver.conf nginx/bsfchat.conf \
+             systemd/bsfchat-backup.service; do
         [ -f "$f" ] || die "$f has not been generated. Run ./setup.sh."
         if grep -q 'CHANGE_ME\|yourdomain\.com\|example\.com\|\${' "$f"; then
             die "$f still contains placeholder values. Run ./setup.sh."
@@ -211,7 +277,26 @@ if [ "$CHECK_ONLY" = 1 ]; then
         esac
     done
 
+    # The backup destination. Every file in it is a complete plaintext copy of
+    # this server — every message, the OIDC signing key, the TURN secret — so
+    # a group or other bit here hands all of it to every local user. The
+    # nightly unit passes --require-private-dest and will refuse to run rather
+    # than keep writing into a directory like that, so this warning is also
+    # the explanation for a timer that has started failing.
+    if [ -d backups ]; then
+        mode=$(ls -ld backups | cut -c1-10)
+        case "$mode" in
+            ????------) ;;
+            *) note "WARNING: backups/ is $mode. Every archive in it is a complete"
+               note "         plaintext copy of this server, readable by more than"
+               note "         its owner. bsfchat-backup.service refuses to run in"
+               note "         this state. Fix with: chmod 0700 backups"
+               note "         Then treat anything already in there as exposed." ;;
+        esac
+    fi
+
     check_installed_nginx
+    check_installed_unit
 
     note "OK: .env is complete and all config files are rendered."
     exit 0
@@ -237,6 +322,8 @@ render() {
         -e "s|\${NGINX_MAX_BODY_MB}|$NGINX_MAX_BODY_MB|g" \
         -e "s|\${REGISTRATION_ENABLED}|$REGISTRATION_ENABLED|g" \
         -e "s|\${ALLOW_PEER_TO_PEER}|$ALLOW_PEER_TO_PEER|g" \
+        -e "s|\${DEPLOY_DIR}|$DEPLOY_DIR|g" \
+        -e "s|\${BACKUP_RETENTION_DAYS}|$BACKUP_RETENTION_DAYS|g" \
         "$src" > "$dst"
     note "wrote $dst"
 }
@@ -245,9 +332,11 @@ render config/server.toml.template     config/server.toml
 render config/identity.toml.template   config/identity.toml
 render config/turnserver.conf.template config/turnserver.conf
 render nginx/bsfchat.conf.template     nginx/bsfchat.conf
+render systemd/bsfchat-backup.service.template systemd/bsfchat-backup.service
 
 # Rendering the file is not installing it. Say so if the two have parted.
 check_installed_nginx
+check_installed_unit
 
 # ---------------------------------------------------------------------------
 # Modes and ownership on the rendered config
@@ -293,7 +382,14 @@ harden_config config/turnserver.conf "$COTURN_UID"
 # identity container (uid 10001) and nginx cannot read.
 chmod 644 config/identity.toml nginx/bsfchat.conf
 
-for f in config/server.toml config/identity.toml config/turnserver.conf nginx/bsfchat.conf; do
+# The unit file carries no secret — a directory path and a number of days — and
+# systemd unit files are conventionally 0644. umask 077 would have made this
+# 0600, which works (systemd reads it as root) but differs from every other
+# unit on the box for no reason.
+chmod 644 systemd/bsfchat-backup.service
+
+for f in config/server.toml config/identity.toml config/turnserver.conf \
+         nginx/bsfchat.conf systemd/bsfchat-backup.service; do
     if grep -q '\${' "$f"; then
         die "$f still has unsubstituted \${...} placeholders — a template gained a
          variable that setup.sh does not know about. Add it to render()."
@@ -301,6 +397,15 @@ for f in config/server.toml config/identity.toml config/turnserver.conf nginx/bs
 done
 
 mkdir -p data/server data/identity
+
+# The nightly backup's destination, created here so it exists and is private
+# from the start rather than being created by whatever ran backup.sh first.
+# umask 077 above makes this 0700 on creation; the chmod is for a directory
+# that already exists at a wider mode, which is the case that matters — the
+# unit passes --require-private-dest and refuses to run otherwise. Every file
+# in here is a complete plaintext copy of the server.
+mkdir -p backups
+chmod 700 backups 2>/dev/null || note "WARNING: could not chmod backups/ to 0700."
 
 # The server and identity images run as uid/gid 10001, not root. A bind
 # mount keeps the HOST directory's ownership — it does not inherit the
@@ -392,5 +497,15 @@ cat <<EOF
        origin-pull limit caps /sync below the protocol's 300s maximum and
        no nginx setting raises it.
     4. docker compose up -d
+    5. Retention — nothing is scheduled until you install the two units and
+       the logrotate config by hand. Until then this deployment keeps nginx
+       logs on whatever schedule the nginx package set, and takes no backups
+       at all. The runbook is "Retention and rotation" in README.md:
+           logrotate/nginx                   -> /etc/logrotate.d/nginx
+           systemd/bsfchat-backup.service    -> /etc/systemd/system/
+           systemd/bsfchat-backup.timer      -> /etc/systemd/system/
+       Backups are kept ${BACKUP_RETENTION_DAYS} days, nginx logs 14. Those two numbers are
+       in bsfchat.com/privacy; if you change them, change what you have told
+       your users.
 
 EOF

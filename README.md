@@ -739,6 +739,14 @@ Two things this does not do:
   Either way, rotate `/var/log/nginx/error.log*` along with the access log
   above. No config change retracts what is already written.
 
+  `logrotate/nginx` in this repo does exactly that, with a 14-day period, and
+  the glob covers `error.log` for this reason rather than incidentally.
+  Installing it is in **"Retention and rotation"** below. Until you do, this
+  deployment's log retention is whatever the nginx package happened to ship —
+  which on Debian and Ubuntu sets `notifempty`, and that quietly does not
+  expire a log that is usually empty. The error log on a healthy deployment is
+  usually empty.
+
 One related thing not to do: **do not add security headers for media in nginx.**
 The chat server sets `X-Content-Type-Options`, `Content-Security-Policy`,
 `X-Frame-Options`, `Referrer-Policy` and `Cross-Origin-Resource-Policy` on media
@@ -794,12 +802,17 @@ age -r <recipient> -o bsfchat-<stamp>.tar.gz.age /tmp/bsfchat-<stamp>.tar.gz
 shred -u /tmp/bsfchat-<stamp>.tar.gz
 ```
 
-A nightly cron, with somewhere to put it that is not this machine:
+This is scheduled by `systemd/bsfchat-backup.timer`, nightly, with a 30-day
+retention period enforced by `./backup.sh --prune-older-than`. Nothing is
+scheduled until you install it — see **"Retention and rotation"** below for the
+runbook.
 
-```cron
-15 4 * * *  cd /root/bsfchat/deploy && ./backup.sh >> /var/log/bsfchat-backup.log 2>&1
-30 4 * * *  find /root/bsfchat/deploy/backups -name 'bsfchat-*.tar.gz' -mtime +14 -delete
-```
+That section replaces the crontab this one used to suggest. The cron line is
+gone rather than kept as an alternative, for three reasons worth knowing if you
+are tempted to reinstate it: `find -delete` in a crontab is neither reviewable
+nor dry-runnable, a crontab has no equivalent of `Persistent=true` so a host
+that was off simply skips the night, and the `>> /var/log/bsfchat-backup.log`
+it redirected into was a fourth log file with no rotation of its own.
 
 ### Proving it restores
 
@@ -869,6 +882,447 @@ Three things that bite:
 - **`CHAT_HOST` is part of every user ID** (`@you:CHAT_HOST`). Restoring onto a
   different domain does not rename anyone; it orphans every account. Restore
   onto the same server name.
+
+## Retention and rotation
+
+Two periods, and both of them are in the privacy policy at
+bsfchat.com/privacy:
+
+| What | Period | Enforced by |
+| --- | --- | --- |
+| nginx access and error logs | **14 days** | `logrotate/nginx` -> `/etc/logrotate.d/nginx` |
+| backup archives | **30 days** | `systemd/bsfchat-backup.*` + `./backup.sh --prune-older-than` |
+
+**Everything in this repo is inert until you install it.** The files are
+committed and rendered; nothing copies them into `/etc` and nothing enables a
+timer, because a unit that writes a complete plaintext copy of the server every
+night is not something a config script should switch on behind your back. Until
+you work through this section, this deployment keeps logs on whatever schedule
+the nginx package set and takes **no backups at all**.
+
+If you change either number, change the policy too. A policy that states a
+retention period it does not implement is the specific failure that document
+exists to avoid.
+
+### Why log retention is a security control here, not housekeeping
+
+The `bsfchat` log format keeps session tokens out of the access log. Nothing
+keeps them out of the **error** log: nginx has no `log_format` for it, its
+entries carry the request line as received, and the desktop client fetches
+media with the token as a query parameter. Token expiry slides forward on use,
+so an error-log line from last week can still be a live credential. Rotation is
+the only expiry those tokens have until signed media tickets take the token out
+of the URL. See "Access logs" above for the full reasoning.
+
+So the 14 days is a bound on credential exposure. Treat a broken rotation as a
+security incident, not a full disk.
+
+### Before you start: size the disk, and rescue old archives
+
+Thirty nightly archives including media is a different footprint from the one
+backup a month you have been taking by hand. Measure first:
+
+```bash
+cd /root/bsfchat/deploy
+df -h .
+du -sh data/server/media data/server/bsfchat.db data/identity/identity.db
+du -sk data/server/media data/server/bsfchat.db data/identity/identity.db \
+  | awk '{t+=$1} END {printf "one archive <= %d MB, 30 of them <= %.1f GB\n", \
+                             t/1024, t*30/1048576}'
+```
+
+That is an upper bound — the archive is gzipped, though media mostly is not. If
+30 of them plus normal headroom does not fit, read "Should the nightly backup
+skip media?" below **before** enabling the timer, not after the disk fills.
+
+Then deal with what is already in `backups/`. **The first run will delete every
+archive there that is 30 days old or older**, including ones you took by hand
+and meant to keep. Look before you enable anything:
+
+```bash
+./backup.sh --prune-only --prune-older-than 30 --dry-run backups
+```
+
+That is read-only. Anything it lists is going. Move it off the host (encrypted
+— see `backup.sh`'s header for the `age` recipe) or accept losing it.
+
+Also confirm the clock, because the timer fires in local time while archive
+names are stamped in UTC:
+
+```bash
+timedatectl | grep 'Time zone'
+```
+
+### Step 1 — purge the nginx logs that are already on disk
+
+Rotation is forward-only. Every access and error log on this host right now,
+and every rotated archive of one, keeps whatever it already contains until the
+new policy ages it out — which for a `.14.gz` is two weeks of holding live
+tokens. Truncate instead of waiting.
+
+```bash
+# What you are about to destroy, so it is a decision and not a surprise:
+grep -c 'access_token=' /var/log/nginx/access.log /var/log/nginx/error.log
+ls -l /var/log/nginx
+
+# truncate, not rm: nginx holds these files open, and deleting the inode
+# sends every subsequent log line to a file nobody can read.
+truncate -s 0 /var/log/nginx/access.log /var/log/nginx/error.log
+rm -f /var/log/nginx/access.log.*.gz /var/log/nginx/access.log.?
+rm -f /var/log/nginx/error.log.*.gz  /var/log/nginx/error.log.?
+
+# The new config creates files 0600, but a rename preserves the old mode, so
+# the files already here keep 0640 until they are recreated. Fix them now.
+chmod 600 /var/log/nginx/*.log
+```
+
+Verify:
+
+```bash
+ls -l /var/log/nginx                       # only access.log and error.log, 0600, size 0
+grep -c 'access_token=' /var/log/nginx/*.log   # want 0
+```
+
+If you have any reason to think a copy of those logs left this host, make
+everyone re-authenticate as well. Rotating a file does not revoke a token that
+has already been read out of it.
+
+There is no undo for this step, which is the point.
+
+### Step 2 — install the logrotate config
+
+First check the assumption the config's `create` line makes. The new log file's
+owner **must** be the user nginx's workers run as, or nginx reopens a file it
+cannot write and logging stops silently while the service keeps serving:
+
+```bash
+nginx -T 2>/dev/null | grep -E '^\s*user\s'    # expect: user www-data;
+ps -o user=,comm= -C nginx | sort -u
+```
+
+If that is not `www-data`, edit the `create` line in
+`/root/bsfchat/deploy/logrotate/nginx` before installing it, and fix
+`logrotate/nginx` in the repo so the next deployment does not reinstate it.
+
+Then install it **as** `/etc/logrotate.d/nginx`, replacing the packaged file:
+
+```bash
+# Keep the packaged one. This is your undo.
+cp -a /etc/logrotate.d/nginx /root/logrotate.d-nginx.packaged.bak
+ls -l /root/logrotate.d-nginx.packaged.bak
+
+cp /root/bsfchat/deploy/logrotate/nginx /etc/logrotate.d/nginx
+
+# NOT optional. logrotate SILENTLY IGNORES a config file in logrotate.d that
+# is not owned by uid 0 -- it prints "Ignoring nginx because the file owner is
+# wrong" and still exits 0. A copy made by anything other than root, or
+# unpacked from a tarball, lands with the wrong owner and your retention
+# policy simply does not run while everything looks healthy.
+chown root:root /etc/logrotate.d/nginx
+chmod 644 /etc/logrotate.d/nginx
+ls -l /etc/logrotate.d/nginx                   # want: -rw-r--r-- root root
+```
+
+**Do not install it under a second name alongside the packaged file.** logrotate
+reads `/etc/logrotate.d` in alphabetical order, the second file to claim
+`/var/log/nginx/*.log` is skipped with `duplicate log entry`, and the whole
+logrotate run then exits 1 — which puts `logrotate.service` into `failed` every
+night and buries real failures for every other log on the box. Which retention
+period applies would also depend on a filename's sort order.
+
+One thing the packaged file does that this one does not: a `prerotate` hook
+running `/etc/logrotate.d/httpd-prerotate`. That directory only exists if some
+other package installed it, and nothing in this deployment uses it. If you have
+one, add the hook back.
+
+### Step 3 — verify the rotation before trusting it
+
+```bash
+# 1. Syntax, and that logrotate is not ignoring the file. Both greps want
+#    NO output.
+logrotate -d /etc/logrotate.conf 2>&1 | grep -i 'ignoring'
+logrotate -d /etc/logrotate.conf 2>&1 | grep -i 'duplicate'
+logrotate -d /etc/logrotate.conf 2>&1 | grep -i '^error'
+
+# 2. Confirm nothing else on this host also claims these paths.
+grep -rl '/var/log/nginx' /etc/logrotate.d/ /etc/logrotate.conf
+#    want exactly: /etc/logrotate.d/nginx
+
+# 3. Confirm the settings logrotate actually parsed. Want "after 1 days" and
+#    "(14 rotations)", and — the one that matters — NOT "empty log files are
+#    not rotated". The exact phrasing of this line varies by logrotate
+#    version: 3.22 spells out "empty log files are rotated, (14 rotations),
+#    old logs are removed after 14 days", while 3.21 prints only
+#    "after 1 days (14 rotations)" and says nothing about maxage either way.
+#    The negative check is the reliable one on both.
+logrotate -d /etc/logrotate.conf 2>&1 | grep -A1 'rotating pattern: /var/log/nginx'
+
+# 4. Force one real rotation now.
+echo 'runbook test line' >> /var/log/nginx/access.log
+logrotate -vf /etc/logrotate.d/nginx
+
+# 5. The part that actually matters: did nginx reopen, and is it still
+#    logging? A failed reopen looks exactly like a quiet server.
+ls -l /var/log/nginx
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1/
+tail -3 /var/log/nginx/access.log         # want that curl in the NEW file
+systemctl status nginx --no-pager | head -5
+```
+
+Step 4 is what closes the loop: if `access.log` is still 0 bytes after that
+`curl`, nginx is writing to a deleted inode and you must
+`systemctl reload nginx` and work out why the `postrotate` signal did not land.
+
+Confirm something will run this daily. On Debian and Ubuntu that is a systemd
+timer, enabled out of the box:
+
+```bash
+systemctl is-enabled logrotate.timer          # want: enabled
+systemctl list-timers logrotate.timer --no-pager
+```
+
+If there is no `logrotate.timer`, `/etc/cron.daily/logrotate` is the fallback;
+confirm `cron` is running.
+
+**Undo steps 2 and 3:**
+
+```bash
+cp -a /root/logrotate.d-nginx.packaged.bak /etc/logrotate.d/nginx
+chown root:root /etc/logrotate.d/nginx
+logrotate -d /etc/logrotate.conf 2>&1 | grep -iE 'ignoring|duplicate|^error'
+```
+
+### Step 4 — render and install the backup units
+
+```bash
+cd /root/bsfchat/deploy
+git pull
+
+# Renders systemd/bsfchat-backup.service with THIS deployment's absolute path
+# and retention period. It re-renders the other configs too and creates
+# backups/ at 0700; it does not restart anything.
+./setup.sh
+
+# Read what it produced before installing it. A unit with a wrong absolute
+# path fails in the quietest way available: a timer that fires on schedule
+# forever and never produces a backup.
+grep -E '^(WorkingDirectory|ExecStart)' systemd/bsfchat-backup.service
+```
+
+Both `ExecStart` lines must name the real deployment directory and end in
+`backups`, and both must carry `--require-private-dest`.
+
+```bash
+cp systemd/bsfchat-backup.service systemd/bsfchat-backup.timer /etc/systemd/system/
+chown root:root /etc/systemd/system/bsfchat-backup.service \
+                /etc/systemd/system/bsfchat-backup.timer
+chmod 644 /etc/systemd/system/bsfchat-backup.service \
+          /etc/systemd/system/bsfchat-backup.timer
+systemctl daemon-reload
+
+systemd-analyze verify /etc/systemd/system/bsfchat-backup.service   # want: silence
+systemd-analyze verify /etc/systemd/system/bsfchat-backup.timer     # want: silence
+ls -ld backups                                                      # want: drwx------
+```
+
+`./setup.sh --check` from now on warns if the installed unit drifts from the
+rendered one, the same way it does for the nginx config.
+
+### Step 5 — one run by hand, before the timer
+
+Never let a schedule be the first thing that runs this.
+
+```bash
+cd /root/bsfchat/deploy
+
+# Read-only: what retention will delete on the first run.
+./backup.sh --prune-only --prune-older-than 30 --dry-run backups
+
+systemctl start bsfchat-backup.service
+systemctl status bsfchat-backup.service --no-pager
+journalctl -u bsfchat-backup.service --no-pager -n 40
+```
+
+In that journal, in this order: the retention lines first, then `space:`, then
+the two `snapshot: ... integrity ok` lines, then `Wrote ... mode 0600`. Retention
+runs **before** the backup on purpose — see the comment block in the unit.
+
+Then prove the archive is real, which is the only part of a backup that can be
+silently wrong:
+
+```bash
+ls -l backups
+./backup.sh --verify backups/bsfchat-<stamp>.tar.gz
+```
+
+If the unit failed, the two likely causes are both loud in the journal:
+`backups` is not `0700` (`chmod 0700 backups`), or `sqlite3` is not installed
+(`apt-get install -y sqlite3`).
+
+### Step 6 — enable the timer
+
+```bash
+systemctl enable --now bsfchat-backup.timer
+systemctl list-timers bsfchat-backup.timer --no-pager
+```
+
+`NEXT` should be tomorrow at 04:15 and `ACTIVATES` should be
+`bsfchat-backup.service`. Enable the **timer**, never the service — the service
+is a `oneshot` the timer starts, and `systemctl enable bsfchat-backup.service`
+is a no-op that looks like it worked.
+
+Check it again the next morning, and make this the routine:
+
+```bash
+systemctl list-timers bsfchat-backup.timer --no-pager   # LAST/PASSED populated
+journalctl -u bsfchat-backup.service --since yesterday --no-pager
+systemctl --failed                                      # want: 0 loaded units
+ls -lt backups | head -5
+df -h /root
+```
+
+**Undo step 6, and step 4:**
+
+```bash
+systemctl disable --now bsfchat-backup.timer
+rm -f /etc/systemd/system/bsfchat-backup.timer \
+      /etc/systemd/system/bsfchat-backup.service
+systemctl daemon-reload
+systemctl list-timers --all --no-pager | grep bsfchat    # want: nothing
+```
+
+Disabling the timer stops the pruning as well as the backups, so the archives
+already on disk then sit there past 30 days with nothing expiring them. If you
+turn this off and leave it off, delete them by hand.
+
+### What "30 days" means exactly
+
+`--prune-older-than 30` deletes archives **30 or more days old**, so what
+survives is the last 30 days — with one backup a night, 30 archives, none of
+them 30 days old. Age comes from the filesystem mtime, not from the stamp in
+the filename, so an archive copied or restored into `backups/` counts as new
+from the moment it landed. The stamp in the name is the real backup time.
+
+It only ever touches files named `bsfchat-<stamp>.tar.gz` directly in that one
+directory. A `bsfchat-<stamp>.tar.gz.age` you encrypted in place does **not**
+match — which also means nothing expires it, so it is on you.
+
+For logs: a line is deleted at most 14 days after the rotation that captured
+it, so a line written just after one rotation can live a few hours short of 15
+days. The period is a 14-day ceiling on rotated data, not a promise about the
+file currently being written.
+
+### Should the nightly backup skip media?
+
+**Recommendation: start with full nightly backups, which is the default, and
+only move to `--no-media` if the sizing at the top of this section says 30 of
+them will not fit comfortably.**
+
+The reasoning, because it cuts both ways. Media is immutable blobs, so 30
+nightly archives contain 30 copies of the same bytes and the 30th copy has
+exactly the restore value of the first — pure duplication, and it dominates the
+archive on any server people actually post to. But a `--no-media` restore
+serves a broken image or a failed download for every attachment ever posted,
+permanently, because the database still references every one of them. A large
+disk is a cheaper problem than a permanently lossy restore, so full-by-default
+is the right way round.
+
+If space says otherwise, the shape that keeps both properties is **daily
+`--no-media` plus a weekly full**: duplication drops to about four media
+copies, and a complete restore is never more than seven days stale. Set it up
+with a drop-in rather than by editing the installed unit:
+
+```bash
+mkdir -p /etc/systemd/system/bsfchat-backup.service.d
+cat > /etc/systemd/system/bsfchat-backup.service.d/no-media.conf <<'EOF'
+[Service]
+# The empty ExecStart= is required: without it this ADDS a second command
+# rather than replacing the inherited one, and you get two backups a night.
+ExecStart=
+ExecStart=/root/bsfchat/deploy/backup.sh --no-media --require-private-dest /root/bsfchat/deploy/backups
+EOF
+systemctl daemon-reload
+systemctl cat bsfchat-backup.service      # confirm ONE ExecStart, with --no-media
+```
+
+Then a weekly full one. Note it keeps `--prune-older-than` out of its own
+ExecStartPre: the nightly unit already prunes the shared directory, and the
+weekly full archives age out on the same 30-day clock as everything else.
+
+```bash
+cat > /etc/systemd/system/bsfchat-backup-full.service <<'EOF'
+[Unit]
+Description=BSFChat weekly full backup (including media)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/bsfchat/deploy
+UMask=0077
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=7200
+ExecStart=/root/bsfchat/deploy/backup.sh --require-private-dest /root/bsfchat/deploy/backups
+EOF
+cat > /etc/systemd/system/bsfchat-backup-full.timer <<'EOF'
+[Unit]
+Description=Weekly full BSFChat backup
+
+[Timer]
+OnCalendar=Sun *-*-* 03:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now bsfchat-backup-full.timer
+systemctl list-timers 'bsfchat-*' --no-pager
+```
+
+Keep the two an hour apart so a long full backup does not overlap the nightly
+prune.
+
+The real answer to the duplication is hard-linking unchanged media between
+archives instead of copying it, which would make 30 full backups cost about one
+plus the deltas. That is a rewrite of how `backup.sh` handles media and it is
+not done here.
+
+### What this does NOT fix
+
+Say the quiet part out loud, because automating a backup changes the risk
+rather than only reducing it.
+
+- **Thirty plaintext copies of the whole server now live next to the server.**
+  Each archive holds every message ever sent, the audit log, every uploaded
+  file, the OIDC RSA signing key — which mints tokens for **any** account — and
+  `.env`, which holds the TURN shared secret. None of it is encrypted at rest.
+  One archive taken by hand and encrypted off the host was a materially smaller
+  exposure than thirty sitting in `backups/`.
+
+  What is in place is a bound, not a fix: `0700` on the directory, `0600` on
+  every archive, a refusal to run at all if either widens
+  (`--require-private-dest`), and a 30-day ceiling. Anyone who gets root on
+  this host, or a read of its filesystem, still gets everything.
+
+  The actual fix is to encrypt each archive to a public key whose private half
+  is **not on this host**, and ship it off the machine. That can be bolted on
+  as an `ExecStartPost` without touching `backup.sh` — the `age` recipe is in
+  `backup.sh`'s header. It is not done here because it needs a recipient key
+  and a destination, and inventing either without somewhere tested to put them
+  would be worse than leaving this written down.
+
+- **Thirty local copies are not off-site.** They survive a bad migration or a
+  fat-fingered `rm`. They do not survive the disk, the VPS, or the provider
+  account.
+
+- **Nothing verifies the archives on a schedule.** `--verify` proves an archive
+  restores, and Step 5 runs it once, by hand. A weekly timer running
+  `./backup.sh --verify` against the newest archive would close that; it is not
+  set up here.
+
+- **Error-log tokens are bounded, not eliminated.** 14 days is an expiry, not a
+  redaction. The fix is the token leaving the URL — signed media tickets — see
+  "Access logs".
 
 ## Updating
 
@@ -982,4 +1436,23 @@ docker compose logs -f server    # just the chat server
 
 These are the application logs. The reverse proxy's access logs are a separate
 thing with a separate hazard — see "Access logs" above before you copy them
-anywhere.
+anywhere, and "Retention and rotation" for how long they are kept and why that
+period is a security control rather than a disk-space setting.
+
+Docker's own capture of these containers' output is a third thing again, and
+**nothing bounds it.** `docker-compose.yml` sets no `logging` options, so the
+daemon's default `json-file` driver keeps everything under
+`/var/lib/docker/containers/` with no size or age limit unless
+`/etc/docker/daemon.json` sets one. `logrotate/nginx` does not touch it and
+neither does `./backup.sh`.
+
+That is a real gap, not a footnote, and it is deliberately not fixed in the same
+change as the two periods above — it needs a decision about what the
+application's own log lines contain before a period can honestly be claimed for
+them. Check what you have and bound it if it is unset:
+
+```bash
+cat /etc/docker/daemon.json 2>/dev/null || echo 'no daemon.json: logs are unbounded'
+docker inspect -f '{{.HostConfig.LogConfig}}' $(docker compose ps -q) 2>/dev/null
+du -sh /var/lib/docker/containers/
+```
