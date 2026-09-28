@@ -1,0 +1,48 @@
+# ===========================================================================
+#  BSFChat nightly backup schedule
+# ===========================================================================
+#  This is the unit you enable:
+#
+#      systemctl enable --now bsfchat-backup.timer
+#
+#  Not a template: there is nothing host-specific in it. The absolute paths
+#  live in bsfchat-backup.service, which ./setup.sh renders.
+#
+#  This replaces the crontab lines README.md used to suggest. A timer rather
+#  than cron because this deployment already runs coturn and nginx under
+#  systemd, so `systemctl list-timers` and `journalctl -u` are the tools
+#  already in use here — and because Persistent=true has no cron equivalent.
+# ===========================================================================
+
+[Unit]
+Description=Nightly BSFChat backup
+Documentation=file:///etc/systemd/system/bsfchat-backup.service
+
+[Timer]
+# 04:15 in the host's LOCAL time zone, matching the crontab line this
+# replaces. backup.sh stamps its archives in UTC regardless, so on a host
+# that is not on UTC the file names will not match the hour you set here.
+# Check which you have: `timedatectl`. A VPS image is usually UTC.
+#
+# A time zone suffix (`04:15:00 UTC`) is deliberately not used: it needs
+# systemd 252 or newer, and a version that does not understand it fails to
+# load the timer rather than ignoring it. Set the host's clock instead.
+OnCalendar=*-*-* 04:15:00
+
+# If the host was off or suspended when the timer should have fired, run once
+# as soon as it is back rather than skipping the night. The state that makes
+# this work is kept in /var/lib/systemd/timers, so it survives reboots.
+#
+# Note the interaction with retention, which is a feature: a host that was off
+# for a week comes back, runs once, and the prune inside the service deletes
+# everything now past the retention period. The period is wall-clock, not
+# "however many times this happened to run".
+Persistent=true
+
+# Nothing else competes for this slot on this host, so no randomised delay —
+# a predictable time is easier to correlate with a journal or an access log.
+# AccuracySec is left at systemd's 1-minute default; a backup does not need
+# to start on the second, and tightening it only wakes the machine harder.
+
+[Install]
+WantedBy=timers.target
